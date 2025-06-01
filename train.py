@@ -1,7 +1,8 @@
 import os
 import torch
 from torch.utils.data import DataLoader
-from transformers import AdamW, get_scheduler
+from torch.optim import AdamW
+from transformers import get_scheduler
 from tqdm import tqdm
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
@@ -31,8 +32,8 @@ def decode_tokens(tokenizer, token_ids):
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_dataset = GrammarCorrectionDataset("sentence/train")
-    valid_dataset = GrammarCorrectionDataset("sentence/valid")
+    train_dataset = GrammarCorrectionDataset("../data/train")
+    valid_dataset = GrammarCorrectionDataset("../data/valid")
 
     train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
     valid_loader = DataLoader(valid_dataset, batch_size=16)
