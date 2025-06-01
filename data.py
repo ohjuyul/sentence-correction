@@ -9,7 +9,7 @@ class GrammarCorrectionDataset(Dataset):
         self.tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
         self.max_length = max_length
 
-        # data_dir 내 모든 json 파일 읽기
+        # data_dir 내 모든 json 파일 리스트
         files = [f for f in os.listdir(data_dir) if f.endswith(".json")]
 
         for fname in files:
@@ -17,11 +17,20 @@ class GrammarCorrectionDataset(Dataset):
             try:
                 with open(path, encoding="utf-8-sig") as f:
                     data = json.load(f)
-                    # json 구조 예: {"ko": "오답 문장", "corrected": "교정 문장"}
-                    src = data.get("ko", None)
-                    tgt = data.get("corrected", None)
-                    if src is not None and tgt is not None:
-                        self.pairs.append((src, tgt))
+
+                    # 데이터가 리스트인지 단일 dict인지 구분
+                    if isinstance(data, list):
+                        for item in data:
+                            src = item.get("ko")
+                            tgt = item.get("corrected")
+                            if src is not None and tgt is not None:
+                                self.pairs.append((src, tgt))
+                    else:
+                        src = data.get("ko")
+                        tgt = data.get("corrected")
+                        if src is not None and tgt is not None:
+                            self.pairs.append((src, tgt))
+
             except Exception as e:
                 print(f"Error loading {fname}: {e}")
 
@@ -46,7 +55,7 @@ class GrammarCorrectionDataset(Dataset):
             return_tensors="pt",
         )
 
-        # CrossEntropyLoss에 맞게 padding token을 -100으로 바꿔줌 (loss 계산시 무시됨)
+        # CrossEntropyLoss에 맞게 padding 토큰을 -100으로 바꿈 (loss 계산시 무시됨)
         labels = target_enc["input_ids"].squeeze(0)
         labels[labels == self.tokenizer.pad_token_id] = -100
 
