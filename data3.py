@@ -1,0 +1,78 @@
+import os
+import json
+from torch.utils.data import Dataset
+from transformers import BertTokenizer
+
+class GrammarCorrectionDataset(Dataset):
+    def __init__(self, data_dir, tokenizer_name="beomi/kcbert-base", max_length=512, stride=64):  # Changed
+        self.tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
+        self.max_length = max_length
+        self.stride = stride
+        self.examples = []  # Changed: 최종 토큰화된 결과 저장
+
+        files = [f for f in os.listdir(data_dir) if f.endswith(".json")]
+
+        for fname in files:
+            path = os.path.join(data_dir, fname)
+            try:
+                with open(path, encoding="utf-8-sig") as f:
+                    data = json.load(f)
+
+                    # 항상 리스트 형태로 변환 (DRY)
+                    seq = data if isinstance(data, list) else [data]  # Changed
+
+                    for item in seq:
+                        if not isinstance(item, dict):
+                            continue
+                        src = item.get("ko")
+                        tgt = item.get("corrected")
+
+                        # 값 검증
+                        if not (isinstance(src, str) and isinstance(tgt, str)):
+                            continue
+                        src, tgt = src.strip(), tgt.strip()
+                        if not (src and tgt):
+                            continue
+
+                        # ---- 슬라이딩 윈도우 토큰화 ----
+                        src_chunks = self.tokenizer(
+                            src,
+                            max_length=self.max_length,
+                            truncation=True,
+                            padding="max_length",
+                            stride=self.stride,
+                            return_overflowing_tokens=True,
+                            return_tensors="pt",
+                        )
+                        tgt_chunks = self.tokenizer(
+                            tgt,
+                            max_length=self.max_length,
+                            truncation=True,
+                            padding="max_length",
+                            stride=self.stride,
+                            return_overflowing_tokens=True,
+                            return_tensors="pt",
+                        )
+
+                        # chunk 개수가 다르면 맞춰서 최소값까지만 사용
+                        n = min(src_chunks["input_ids"].size(0), tgt_chunks["input_ids"].size(0))
+                        for i in range(n):
+                            input_ids = src_chunks["input_ids"][i]
+                            attention_mask = src_chunks["attention_mask"][i]
+                            labels = tgt_chunks["input_ids"][i].clone()
+                            labels[labels == self.tokenizer.pad_token_id] = -100  # 패딩 무시
+
+                            self.examples.append({
+                                "input_ids": input_ids,
+                                "attention_mask": attention_mask,
+                                "labels": labels,
+                            })
+
+            except Exception as e:
+                print(f"Error loading {fname}: {e}")
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[idx]
