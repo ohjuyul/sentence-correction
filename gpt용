@@ -1,35 +1,189 @@
-# delete_empty_ko_corrected.py
+# classfy.py
 from pathlib import Path
+import argparse
 import json
+import sys
 
-def is_empty_value(v):
-    """빈 문자열 또는 None 여부 확인"""
-    return v is None or (isinstance(v, str) and not v.strip())
+# --------------------------- 공통 유틸 ---------------------------
 
-def should_delete_json(path: Path):
-    """JSON 파일에 ko 또는 corrected가 비어있는지 검사"""
-    try:
-        with path.open("r", encoding="utf-8-sig") as f:
-            obj = json.load(f)
-    except json.JSONDecodeError:
-        return False  # 깨진 JSON은 삭제하지 않음
+def iter_jsonlike_files(roots):
+    """여러 root 아래의 .json/.jsonl 파일을 재귀적으로 순회합니다."""
+    for root in roots:
+        r = Path(root)
+        if not r.exists():
+            continue
+        for ext in ("*.json", "*.jsonl"):
+            yield from r.rglob(ext)
 
+def normalize_line(s):
+    """개행/탭/다중 공백을 한 줄로 정규화."""
+    if s is None:
+        return ""
+    return " ".join(str(s).split())
+
+# --------------------------- 탐색 유틸 ---------------------------
+
+def find_pairs_in_obj(obj):
+    """
+    객체에서 (ko, corrected) 쌍을 모두 찾아 생성합니다.
+    - dict 레벨에서 'ko'와 'corrected'가 함께 있을 때만 한 쌍으로 간주
+    - 리스트/중첩 dict는 재귀 탐색
+    """
     if isinstance(obj, dict):
-        return is_empty_value(obj.get("ko")) or is_empty_value(obj.get("corrected"))
+        if "ko" in obj and "corrected" in obj:
+            ko = normalize_line(obj.get("ko"))
+            corr = normalize_line(obj.get("corrected"))
+            if ko and corr:
+                yield (ko, corr)
+        for v in obj.values():
+            yield from find_pairs_in_obj(v)
+        return
+    if isinstance(obj, list):
+        for item in obj:
+            yield from find_pairs_in_obj(item)
+        return
+    return
 
-    return False  # 예상 외 구조는 삭제하지 않음
+def find_single_anywhere(o, key):
+    """
+    객체 전체에서 key가 '정확히 1개'만 존재하면 그 값을 반환.
+    여러 개면 모호하므로 빈 문자열 반환.
+    """
+    vals = []
+
+    def _collect(x):
+        if isinstance(x, dict):
+            if key in x and x[key]:
+                vals.append(normalize_line(x.get(key)))
+            for v in x.values():
+                _collect(v)
+        elif isinstance(x, list):
+            for it in x:
+                _collect(it)
+
+    _collect(o)
+    vals = [v for v in vals if v]
+    return vals[0] if len(vals) == 1 else ""
+
+def get_first_anywhere(o, key):
+    """객체 전체에서 key의 '첫 번째' 값을 반환. 없으면 빈 문자열."""
+    if isinstance(o, dict):
+        if key in o and o[key]:
+            return normalize_line(o[key])
+        for v in o.values():
+            got = get_first_anywhere(v, key)
+            if got:
+                return got
+    elif isinstance(o, list):
+        for it in o:
+            got = get_first_anywhere(it, key)
+            if got:
+                return got
+    return ""
+
+# --------------------------- 파싱 & 추출 ---------------------------
+
+def parse_json_file(path: Path):
+    """
+    파일 하나(.json/.jsonl)에서 (ko, corrected) 쌍을 스트리밍으로 생성.
+    1) 같은 dict 레벨에서 매칭
+    2) 없으면, 파일(또는 라인) 안에 ko/corrected가 각 1개씩만 있으면 1:1 매칭
+    3) 그래도 없으면, '첫 번째' 값끼리 폴백 매칭
+    """
+    suf = path.suffix.lower()
+    if suf == ".jsonl":
+        with path.open("r", encoding="utf-8-sig") as f:  # BOM 대응
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                yielded = False
+                for pair in find_pairs_in_obj(obj):
+                    yielded = True
+                    yield pair
+
+                if not yielded:
+                    # 2) 파일(라인) 내 정확히 1개씩이면 매칭
+                    ko1 = find_single_anywhere(obj, "ko")
+                    cr1 = find_single_anywhere(obj, "corrected")
+                    if ko1 and cr1:
+                        yield (ko1, cr1)
+                    else:
+                        # 3) 첫 번째 값으로 폴백 매칭
+                        ko_first = get_first_anywhere(obj, "ko")
+                        cr_first = get_first_anywhere(obj, "corrected")
+                        if ko_first and cr_first:
+                            yield (ko_first, cr_first)
+    else:
+        try:
+            with path.open("r", encoding="utf-8-sig") as f:  # BOM 대응
+                obj = json.load(f)
+        except json.JSONDecodeError:
+            return
+
+        yielded = False
+        for pair in find_pairs_in_obj(obj):
+            yielded = True
+            yield pair
+
+        if not yielded:
+            ko1 = find_single_anywhere(obj, "ko")
+            cr1 = find_single_anywhere(obj, "corrected")
+            if ko1 and cr1:
+                yield (ko1, cr1)
+            else:
+                ko_first = get_first_anywhere(obj, "ko")
+                cr_first = get_first_anywhere(obj, "corrected")
+                if ko_first and cr_first:
+                    yield (ko_first, cr_first)
+
+# --------------------------- 쓰기 ---------------------------
+
+def write_pairs(pairs_iter, ko_out_path: Path, corr_out_path: Path, log_every:int=10000):
+    """(ko, corrected) 스트림을 받아 두 파일에 같은 순서로 기록 + 진행 로그."""
+    count = 0
+    with ko_out_path.open("w", encoding="utf-8") as f_ko, corr_out_path.open("w", encoding="utf-8") as f_corr:
+        for ko, corr in pairs_iter:
+            f_ko.write(ko + "\n")
+            f_corr.write(corr + "\n")
+            count += 1
+            if log_every and (count % log_every == 0):
+                print(f"[pairs] written={count}", file=sys.stderr)
+    return count
+
+# --------------------------- 엔트리포인트 ---------------------------
 
 def main():
-    base_dirs = ["./data/train", "./data/valid"]
-    deleted_count = 0
+    ap = argparse.ArgumentParser(description="Extract (ko, corrected) pairs to txt")
+    ap.add_argument("--dirs", nargs="+", required=True, help="검색할 루트 디렉터리들 (예: ./data/train ./data/valid)")
+    ap.add_argument("--out-ko", default="./ko.txt")
+    ap.add_argument("--out-correct", default="./correct.txt")
+    ap.add_argument("--log-every", type=int, default=10000, help="진행 로그 출력 주기(쌍 개수 기준)")
+    args = ap.parse_args()
 
-    for base_dir in base_dirs:
-        for path in Path(base_dir).rglob("*.json"):
-            if should_delete_json(path):
-                path.unlink()
-                deleted_count += 1
+    files_iter = iter_jsonlike_files(args.dirs)
 
-    print(f"[done] Deleted {deleted_count} JSON files.")
+    def gen_pairs_with_progress():
+        files_seen = 0
+        for p in files_iter:
+            files_seen += 1
+            if files_seen % 10000 == 0:
+                print(f"[scan] files={files_seen}", file=sys.stderr)
+            yield from parse_json_file(p)
+        print(f"[scan] done. files={files_seen}", file=sys.stderr)
+
+    total_pairs = write_pairs(
+        pairs_iter=gen_pairs_with_progress(),
+        ko_out_path=Path(args.out_ko),
+        corr_out_path=Path(args.out_correct),
+        log_every=args.log_every
+    )
+    print(f"[done] total_pairs={total_pairs}")
 
 if __name__ == "__main__":
     main()
