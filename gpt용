@@ -1,15 +1,90 @@
-{
-    "id": "100008-1-4-12",
-    "fileName": "TX_CA_1_100008-1-4-12",
-    "dataSet": "한국어 철자 및 맞춤법 교정용 병렬 데이터",
-    "domain": "CA",
-    "ko": "난 신혼여행으로 갔다왔는데 프라하가 제일 좋았어.",
-    "corrected": "난 신혼여행으로 갔다 왔는데 프라하가 제일 좋았어.",
-    "error": [
-        {
-            "errorType": "spac",
-            "startPoint": 9,
-            "endPoint": 14
-        }
-    ]
-}
+from pathlib import Path
+import argparse
+import json
+import sys
+
+def iter_json_files(roots):
+    for root in roots:
+        r = Path(root)
+        if not r.exists():
+            continue
+        for ext in ("*.json", "*.jsonl"):
+            yield from r.rglob(ext)
+
+def normalize(s):
+    if s is None:
+        return ""
+    return " ".join(str(s).split())
+
+def get_value_anywhere(obj, key):
+    """객체 전체에서 key의 첫 번째 값 반환."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            found = get_value_anywhere(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for it in obj:
+            found = get_value_anywhere(it, key)
+            if found is not None:
+                return found
+    return None
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dirs", nargs="+", required=True)
+    args = ap.parse_args()
+
+    stats = {
+        "total_files": 0,
+        "json_error": 0,
+        "missing_ko": 0,
+        "missing_corrected": 0,
+        "empty_ko": 0,
+        "empty_corrected": 0,
+        "typo_corrected": 0
+    }
+
+    typo_variants = {"correcetd", "corretced", "correted"}  # 확장 가능
+
+    for path in iter_json_files(args.dirs):
+        stats["total_files"] += 1
+
+        try:
+            with path.open("r", encoding="utf-8-sig") as f:
+                if path.suffix.lower() == ".jsonl":
+                    obj = json.loads(f.readline())
+                else:
+                    obj = json.load(f)
+        except Exception:
+            stats["json_error"] += 1
+            continue
+
+        ko_val = get_value_anywhere(obj, "ko")
+        corr_val = get_value_anywhere(obj, "corrected")
+
+        # key 오타 탐지
+        if corr_val is None:
+            for typo in typo_variants:
+                if get_value_anywhere(obj, typo) is not None:
+                    stats["typo_corrected"] += 1
+                    break
+
+        if ko_val is None:
+            stats["missing_ko"] += 1
+        elif normalize(ko_val) == "":
+            stats["empty_ko"] += 1
+
+        if corr_val is None:
+            stats["missing_corrected"] += 1
+        elif normalize(corr_val) == "":
+            stats["empty_corrected"] += 1
+
+    print("\n=== 진단 결과 ===")
+    for k, v in stats.items():
+        print(f"{k}: {v}")
+
+if __name__ == "__main__":
+    main()
