@@ -51,7 +51,7 @@ def parse_json_file(path: Path):
     """파일 하나(.json/.jsonl)에서 (ko, corrected) 쌍을 스트리밍으로 생성."""
     suf = path.suffix.lower()
     if suf == ".jsonl":
-        with path.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -63,7 +63,7 @@ def parse_json_file(path: Path):
                 yield from find_pairs_in_obj(obj)
     else:
         try:
-            with path.open("r", encoding="utf-8") as f:
+            with path.open("r", encoding="utf-8-sig") as f:
                 obj = json.load(f)
         except json.JSONDecodeError:
             return
