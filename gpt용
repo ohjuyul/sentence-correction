@@ -1,22 +1,5 @@
-root@986d73f0cf4d:/workspace/sentence/spm_out# python3 check.py   --xml /path/to/kowiki-20250801-pages-articles-multistream.xml.bz2   --spm decoder_spm_bpe24k.model   --out wiki_eval.txt   --sample 50000
-Traceback (most recent call last):
-  File "/workspace/sentence/spm_out/check.py", line 202, in <module>
-    main()
-  File "/workspace/sentence/spm_out/check.py", line 185, in main
-    sents = extract_sentence_samples(args.xml, sample=args.sample)
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/sentence/spm_out/check.py", line 138, in extract_sentence_samples
-    for raw in iter_wiki_texts(xml_path):
-  File "/workspace/sentence/spm_out/check.py", line 29, in iter_wiki_texts
-    with open_xml_stream(xml_path) as f:
-         ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/sentence/spm_out/check.py", line 17, in open_xml_stream
-    return bz2.open(p, "rb")
-           ^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/bz2.py", line 304, in open
-    binary_file = BZ2File(filename, bz_mode, compresslevel=compresslevel)
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/bz2.py", line 81, in __init__
-    self._fp = _builtin_open(filename, mode)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-FileNotFoundError: [Errno 2] No such file or directory: '/path/to/kowiki-20250801-pages-articles-multistream.xml.bz2'
+python3 check.py \
+  --xml /workspace/sentence/kowiki-20250801-pages-articles-multistream.xml.bz2 \
+  --spm decoder_spm_bpe24k.model \
+  --out wiki_eval.txt \
+  --sample 50000
