@@ -1,6 +1,33 @@
-python3 check.py \
-  --model decoder_spm_bpe24k.model \
-  --txt wiki_eval.txt \
-  --sample 50000 \
-  --topn 30 \
-  --maxlen 2
+[avg tokens/line] 23.35
+[token char length] mean=1.98, p50=2.0, p90=3.0
+[short pieces (len<=2)] top30
+▁ 36675
+. 33117
+, 24179
+* 13992
+' 13360
+의 12580
+) 11055
+( 11017
+\ 9212
+년 7653
+a 7265
+t 6653
+- 6146
+e 5890
+에 5576
+월 5255
+i 5211
+은 5097
+을 5084
+일 5020
+| 4820
+o 4685
+과 4248
+c 4212
+: 3983
+▁수 3876
+h 3796
+s 3717
+에서 3652
+▁' 3603
