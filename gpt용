@@ -1,5 +1,43 @@
-python3 check.py \
-  --xml /workspace/sentence/kowiki-20250801-pages-articles-multistream.xml.bz2 \
-  --spm decoder_spm_bpe24k.model \
-  --out wiki_eval.txt \
-  --sample 50000
+import sentencepiece as spm
+from collections import Counter
+
+def token_length_stats(model_file, txt_file, sample_lines=None):
+    sp = spm.SentencePieceProcessor(model_file=model_file)
+    total_tokens = 0
+    total_lines = 0
+    char_per_token = []
+
+    with open(txt_file, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if sample_lines and i >= sample_lines:
+                break
+            s = line.strip()
+            if not s: continue
+            pieces = sp.encode(s, out_type=str)
+            total_tokens += len(pieces); total_lines += 1
+            # 토큰 길이(문자 기준) 분포
+            char_per_token.extend([len(p) for p in pieces])
+
+    avg_tok = total_tokens / max(1, total_lines)
+    print(f"[avg tokens/line] {avg_tok:.2f}")
+    if char_per_token:
+        import numpy as np
+        arr = np.array(char_per_token)
+        print(f"[token char length] mean={arr.mean():.2f}, p50={np.percentile(arr,50):.1f}, p90={np.percentile(arr,90):.1f}")
+
+def top_short_pieces(model_file, txt_file, topn=30, sample_lines=None):
+    sp = spm.SentencePieceProcessor(model_file=model_file)
+    cnt = Counter()
+    with open(txt_file, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if sample_lines and i >= sample_lines:
+                break
+            s = line.strip()
+            if not s: continue
+            pieces = sp.encode(s, out_type=str)
+            for p in pieces:
+                if len(p) <= 2:   # 지나치게 짧은 조각
+                    cnt[p] += 1
+    print(f"[short pieces (len<=2)] top{topn}")
+    for p, c in cnt.most_common(topn):
+        print(p, c)
