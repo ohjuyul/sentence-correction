@@ -1,3 +1,5 @@
-root@986d73f0cf4d:/workspace/sentence# sudo apt install python3-sentencepiece
-bash: sudo: command not found
-root@986d73f0cf4d:/workspace/sentenc
+root@986d73f0cf4d:/workspace/sentence# apt install python3-sentencepiece-y
+Reading package lists... Done
+Building dependency tree... Done
+Reading state information... Done
+E: Unable to locate package python3-sentencepiece-y
