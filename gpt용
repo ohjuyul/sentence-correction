@@ -1,43 +1,111 @@
-import sentencepiece as spm
+#!/usr/bin/env python3
+import argparse
 from collections import Counter
+from typing import Optional, Iterable, List
 
-def token_length_stats(model_file, txt_file, sample_lines=None):
+import sentencepiece as spm
+
+
+# -----------------------------
+# 유틸
+# -----------------------------
+def _iter_lines(path: str, sample_lines: Optional[int]) -> Iterable[str]:
+    """한 줄=한 문장 형식의 텍스트 파일을 앞에서 sample_lines줄까지 순회"""
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if sample_lines is not None and i >= sample_lines:
+                break
+            s = line.strip()
+            if s:
+                yield s
+
+
+def _percentiles(values: List[float], pcts=(50, 90)) -> List[float]:
+    """numpy가 없어도 동작하는 간단 퍼센타일 계산"""
+    if not values:
+        return [0.0 for _ in pcts]
+    try:
+        import numpy as np  # 선택 의존성
+        arr = np.array(values, dtype=float)
+        return [float(np.percentile(arr, p)) for p in pcts]
+    except Exception:
+        vals = sorted(values)
+        out = []
+        for p in pcts:
+            if p <= 0:
+                out.append(float(vals[0]))
+                continue
+            if p >= 100:
+                out.append(float(vals[-1]))
+                continue
+            k = (p / 100.0) * (len(vals) - 1)
+            lo = int(k)
+            hi = min(lo + 1, len(vals) - 1)
+            frac = k - lo
+            out.append(float(vals[lo] * (1 - frac) + vals[hi] * frac))
+        return out
+
+
+# -----------------------------
+# 1) 토큰 길이 통계
+# -----------------------------
+def token_length_stats(model_file: str, txt_file: str, sample_lines: Optional[int] = None) -> None:
+    """
+    - 평균 토큰/문장
+    - 토큰 문자열 길이의 mean, p50, p90
+    """
     sp = spm.SentencePieceProcessor(model_file=model_file)
+
     total_tokens = 0
     total_lines = 0
-    char_per_token = []
+    char_per_token: List[int] = []
 
-    with open(txt_file, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if sample_lines and i >= sample_lines:
-                break
-            s = line.strip()
-            if not s: continue
-            pieces = sp.encode(s, out_type=str)
-            total_tokens += len(pieces); total_lines += 1
-            # 토큰 길이(문자 기준) 분포
-            char_per_token.extend([len(p) for p in pieces])
+    for s in _iter_lines(txt_file, sample_lines):
+        pieces = sp.encode(s, out_type=str)
+        total_tokens += len(pieces)
+        total_lines += 1
+        char_per_token.extend(len(p) for p in pieces)
 
     avg_tok = total_tokens / max(1, total_lines)
-    print(f"[avg tokens/line] {avg_tok:.2f}")
-    if char_per_token:
-        import numpy as np
-        arr = np.array(char_per_token)
-        print(f"[token char length] mean={arr.mean():.2f}, p50={np.percentile(arr,50):.1f}, p90={np.percentile(arr,90):.1f}")
+    p50, p90 = _percentiles(char_per_token, (50, 90))
+    mean_len = (sum(char_per_token) / len(char_per_token)) if char_per_token else 0.0
 
-def top_short_pieces(model_file, txt_file, topn=30, sample_lines=None):
+    print(f"[avg tokens/line] {avg_tok:.2f}")
+    print(f"[token char length] mean={mean_len:.2f}, p50={p50:.1f}, p90={p90:.1f}")
+
+
+# -----------------------------
+# 2) 짧은 조각(길이<=max_len) Top-N
+# -----------------------------
+def top_short_pieces(model_file: str, txt_file: str, topn: int = 30, sample_lines: Optional[int] = None, max_len: int = 2) -> None:
     sp = spm.SentencePieceProcessor(model_file=model_file)
-    cnt = Counter()
-    with open(txt_file, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if sample_lines and i >= sample_lines:
-                break
-            s = line.strip()
-            if not s: continue
-            pieces = sp.encode(s, out_type=str)
-            for p in pieces:
-                if len(p) <= 2:   # 지나치게 짧은 조각
-                    cnt[p] += 1
-    print(f"[short pieces (len<=2)] top{topn}")
-    for p, c in cnt.most_common(topn):
-        print(p, c)
+    cnt: Counter = Counter()
+
+    for s in _iter_lines(txt_file, sample_lines):
+        for p in sp.encode(s, out_type=str):
+            if len(p) <= max_len:
+                cnt[p] += 1
+
+    print(f"[short pieces (len<={max_len})] top{topn}")
+    for piece, c in cnt.most_common(topn):
+        print(piece, c)
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser(description="SentencePiece 토크나이저 분석 도구")
+    ap.add_argument("--model", required=True, help="SentencePiece .model 경로")
+    ap.add_argument("--txt", required=True, help="평가용 텍스트(.txt, 한 줄=한 문장)")
+    ap.add_argument("--sample", type=int, default=None, help="앞에서 N줄만 사용(옵션)")
+    ap.add_argument("--topn", type=int, default=30, help="짧은 조각 상위 N개")
+    ap.add_argument("--maxlen", type=int, default=2, help="짧은 조각으로 간주할 최대 길이")
+    args = ap.parse_args()
+
+    token_length_stats(args.model, args.txt, sample_lines=args.sample)
+    top_short_pieces(args.model, args.txt, topn=args.topn, sample_lines=args.sample, max_len=args.maxlen)
+
+
+if __name__ == "__main__":
+    main()
