@@ -1,14 +1,69 @@
-root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
-You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
-/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
-  warnings.warn(
-Traceback (most recent call last):
-  File "/workspace/sentence/src/check.py", line 18, in <module>
-    train_loader = DataLoader(dataset, batch_size=8, shuffle=True)
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataloader.py", line 385, in __init__
-    sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/sampler.py", line 156, in __init__
-    raise ValueError(
-ValueError: num_samples should be a positive integer value, but got num_samples=0
+class GrammarCorrectionDataset(Dataset):
+    def __init__(self, data_dir, tokenizer_name="beomi/kcbert-base", max_length=512, stride=64):
+        self.tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
+        self.max_length = max_length
+        self.stride = stride
+        self.examples = []
+
+        files = [f for f in os.listdir(data_dir) if f.endswith(".json")]
+        print(f"Found {len(files)} JSON files in {data_dir}")  # 디버깅용 출력
+
+        for fname in files:
+            path = os.path.join(data_dir, fname)
+            try:
+                with open(path, encoding="utf-8-sig") as f:
+                    data = json.load(f)
+
+                    # 항상 리스트 형태로 변환 (DRY)
+                    seq = data if isinstance(data, list) else [data]
+
+                    for item in seq:
+                        if not isinstance(item, dict):
+                            continue
+                        src = item.get("ko")
+                        tgt = item.get("corrected")
+
+                        # 값 검증
+                        if not (isinstance(src, str) and isinstance(tgt, str)):
+                            continue
+                        src, tgt = src.strip(), tgt.strip()
+                        if not (src and tgt):
+                            continue
+
+                        # ---- 슬라이딩 윈도우 토큰화 ----
+                        src_chunks = self.tokenizer(
+                            src,
+                            max_length=self.max_length,
+                            truncation=True,
+                            padding="max_length",
+                            stride=self.stride,
+                            return_overflowing_tokens=True,
+                            return_tensors="pt",
+                        )
+                        tgt_chunks = self.tokenizer(
+                            tgt,
+                            max_length=self.max_length,
+                            truncation=True,
+                            padding="max_length",
+                            stride=self.stride,
+                            return_overflowing_tokens=True,
+                            return_tensors="pt",
+                        )
+
+                        n = min(src_chunks["input_ids"].size(0), tgt_chunks["input_ids"].size(0))
+                        for i in range(n):
+                            input_ids = src_chunks["input_ids"][i]
+                            attention_mask = src_chunks["attention_mask"][i]
+                            labels = tgt_chunks["input_ids"][i].clone()
+                            labels[labels == self.tokenizer.pad_token_id] = -100  # 패딩 무시
+
+                            self.examples.append({
+                                "input_ids": input_ids,
+                                "attention_mask": attention_mask,
+                                "labels": labels,
+                            })
+
+            except Exception as e:
+                print(f"Error loading {fname}: {e}")
+
+        print(f"Loaded {len(self.examples)} examples.")  # 디버깅용 출력
