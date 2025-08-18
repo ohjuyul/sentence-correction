@@ -1,14 +1,4 @@
-root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
-You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
-/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
-  warnings.warn(
-Traceback (most recent call last):
-  File "/workspace/sentence/src/check.py", line 18, in <module>
-    train_loader = DataLoader(dataset, batch_size=8, shuffle=True)
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataloader.py", line 385, in __init__
-    sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/sampler.py", line 156, in __init__
-    raise ValueError(
-ValueError: num_samples should be a positive integer value, but got num_samples=0
+import os
+
+data_dir = "../data"
+print(f"Checking if the directory exists: {os.path.exists(data_dir)}")
