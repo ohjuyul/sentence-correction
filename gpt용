@@ -1,13 +1,7 @@
-# 모델-디코더 토크나이저 동기화
-assert model.config.pad_token_id == model.dec_tok.pad_token_id
-assert model.config.eos_token_id == model.dec_tok.eos_token_id
-assert model.config.decoder_start_token_id == getattr(model.dec_tok, "bos_token_id", None)
-
-# 출력 차원 vs Vocab
-assert model.output_projection.out_features == model.dec_tok.vocab_size
-
-# 배치 검사
-batch = next(iter(train_loader))
-assert batch["labels"].max().item() < model.dec_tok.vocab_size
-assert batch["decoder_input_ids"][:, 0].eq(model.dec_tok.bos_token_id).all()
-assert set(batch["decoder_attention_mask"].unique().tolist()) <= {0, 1}
+root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
+Traceback (most recent call last):
+  File "/workspace/sentence/src/check.py", line 2, in <module>
+    assert model.config.pad_token_id == model.dec_tok.pad_token_id
+           ^^^^^
+NameError: name 'model' is not defined
+root@986d73f0cf4d:/workspace/sentence/src# 
