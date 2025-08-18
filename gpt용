@@ -1,4 +1,7 @@
-import os
-
-data_dir = "../data"
-print(f"Checking if the directory exists: {os.path.exists(data_dir)}")
+root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
+Checking if the directory exists: True
+Traceback (most recent call last):
+  File "/workspace/sentence/src/check.py", line 3, in <module>
+    from data3 import GrammarCorrectionDataset  # Dataset 임포트
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ImportError: cannot import name 'GrammarCorrectionDataset' from 'data3' (/workspace/sentence/src/data3.py)
