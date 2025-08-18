@@ -1,21 +1,9 @@
-root@986d73f0cf4d:/workspace/sentence/src# apt install python3-protobuf
-Reading package lists... Done
-Building dependency tree... Done
-Reading state information... Done
-The following additional packages will be installed:
-  libprotobuf32t64
-The following NEW packages will be installed:
-  libprotobuf32t64 python3-protobuf
-0 upgraded, 2 newly installed, 0 to remove and 7 not upgraded.
-Need to get 1121 kB of archives.
-After this operation, 4154 kB of additional disk space will be used.
-Do you want to continue? [Y/n] y
-Ign:1 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libprotobuf32t64 amd64 3.21.12-8.2ubuntu0.1
-Ign:2 http://archive.ubuntu.com/ubuntu noble-updates/universe amd64 python3-protobuf amd64 3.21.12-8.2ubuntu0.1
-Err:1 http://security.ubuntu.com/ubuntu noble-updates/main amd64 libprotobuf32t64 amd64 3.21.12-8.2ubuntu0.1
-  404  Not Found [IP: 185.125.190.82 80]
-Err:2 http://security.ubuntu.com/ubuntu noble-updates/universe amd64 python3-protobuf amd64 3.21.12-8.2ubuntu0.1
-  404  Not Found [IP: 185.125.190.82 80]
-E: Failed to fetch http://security.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf32t64_3.21.12-8.2ubuntu0.1_amd64.deb  404  Not Found [IP: 185.125.190.82 80]
-E: Failed to fetch http://security.ubuntu.com/ubuntu/pool/universe/p/protobuf/python3-protobuf_3.21.12-8.2ubuntu0.1_amd64.deb  404  Not Found [IP: 185.125.190.82 80]
-E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?
+root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
+You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
+/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
+  warnings.warn(
+Traceback (most recent call last):
+  File "/workspace/sentence/src/check.py", line 11, in <module>
+    model = CorrectionModel(
+            ^^^^^^^^^^^^^^^^
+TypeError: CorrectionModel.__init__() got an unexpected keyword argument 'decoder_tokenizer'
