@@ -1,4 +1,18 @@
 root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
 Using device: cuda
 You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
-Killed
+{'input_ids': tensor([[    2,  8538,  4567,  ...,     0,     0,     0],
+        [    2,  2629,  4276,  ...,     0,     0,     0],
+        [    2, 15509,  8182,  ...,     0,     0,     0],
+        [    2, 14668, 14115,  ...,     0,     0,     0]], device='cuda:0'), 'attention_mask': tensor([[1, 1, 1,  ..., 0, 0, 0],
+        [1, 1, 1,  ..., 0, 0, 0],
+        [1, 1, 1,  ..., 0, 0, 0],
+        [1, 1, 1,  ..., 0, 0, 0]], device='cuda:0'), 'labels': tensor([[    2,  3209,  4053,  ...,  -100,  -100,  -100],
+        [    2,  2635, 23929,  ...,  -100,  -100,  -100],
+        [    2,  2303,  4349,  ...,  -100,  -100,  -100],
+        [    2, 14668, 12821,  ...,  -100,  -100,  -100]], device='cuda:0')}
+Traceback (most recent call last):
+  File "/workspace/sentence/src/check.py", line 47, in <module>
+    assert batch["labels"].max().item() < model.dec_tok.vocab_size
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
