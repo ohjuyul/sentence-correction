@@ -1,33 +1,13 @@
-[avg tokens/line] 23.35
-[token char length] mean=1.98, p50=2.0, p90=3.0
-[short pieces (len<=2)] top30
-▁ 36675
-. 33117
-, 24179
-* 13992
-' 13360
-의 12580
-) 11055
-( 11017
-\ 9212
-년 7653
-a 7265
-t 6653
-- 6146
-e 5890
-에 5576
-월 5255
-i 5211
-은 5097
-을 5084
-일 5020
-| 4820
-o 4685
-과 4248
-c 4212
-: 3983
-▁수 3876
-h 3796
-s 3717
-에서 3652
-▁' 3603
+# 모델-디코더 토크나이저 동기화
+assert model.config.pad_token_id == model.dec_tok.pad_token_id
+assert model.config.eos_token_id == model.dec_tok.eos_token_id
+assert model.config.decoder_start_token_id == getattr(model.dec_tok, "bos_token_id", None)
+
+# 출력 차원 vs Vocab
+assert model.output_projection.out_features == model.dec_tok.vocab_size
+
+# 배치 검사
+batch = next(iter(train_loader))
+assert batch["labels"].max().item() < model.dec_tok.vocab_size
+assert batch["decoder_input_ids"][:, 0].eq(model.dec_tok.bos_token_id).all()
+assert set(batch["decoder_attention_mask"].unique().tolist()) <= {0, 1}
