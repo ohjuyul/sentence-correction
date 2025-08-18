@@ -1,4 +1,4 @@
-root@986d73f0cf4d:/workspace/sentence/src# pip install protobuf
+root@986d73f0cf4d:/workspace/sentence/src# pip install protobuf--break system-packages
 error: externally-managed-environment
 
 × This environment is externally managed
