@@ -1,52 +1,27 @@
-import warnings
-import torch
-from torch.utils.data import DataLoader
-from model3 import CorrectionModel  # 모델 임포트
-from data3 import GrammarCorrectionDataset  # Dataset 임포트
-from transformers import T5TokenizerFast
-
-# 경고 무시
-warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
-
-# GPU 설정 확인
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-# 디코더 토크나이저 로딩
-dec_tok = T5TokenizerFast(vocab_file="../spm_out/tokenizer_24k.model", extra_ids=0)
-
-# 모델 로딩
-model = CorrectionModel(
-    encoder_name="beomi/kcbert-base",
-    num_decoder_layers=6,
-    decoder_tokenizer=dec_tok,  # decoder_tokenizer 전달
-)
-model.to(device)  # 모델을 GPU로 이동
-
-# 데이터셋 로딩
-dataset = GrammarCorrectionDataset(data_dir="../data/train", tokenizer_name="beomi/kcbert-base")
-train_loader = DataLoader(dataset, batch_size=8, shuffle=True)
-
-# 배치 테스트
-batch = next(iter(train_loader))  # 첫 번째 배치 가져오기
-
-# 배치 데이터 GPU로 이동
-batch = {k: v.to(device) for k, v in batch.items()}
-
-print(batch)  # 배치 확인
-
-# 모델-디코더 토크나이저 동기화 확인
-assert model.config.pad_token_id == model.dec_tok.pad_token_id
-assert model.config.eos_token_id == model.dec_tok.eos_token_id
-assert model.config.decoder_start_token_id == getattr(model.dec_tok, "bos_token_id", None)
-
-# 출력 차원 vs Vocab 크기 일치 확인
-assert model.output_projection.out_features == model.dec_tok.vocab_size
-
-# 배치 검사 (패딩값 제외하고 최대값 비교)
-valid_labels = batch["labels"][batch["labels"] != -100]  # 패딩 값 제외
-assert valid_labels.max().item() < model.dec_tok.vocab_size  # 패딩 제외하고 최대값이 vocab_size보다 작은지 확인
-assert batch["decoder_input_ids"][:, 0].eq(model.dec_tok.bos_token_id).all()
-assert set(batch["decoder_attention_mask"].unique().tolist()) <= {0, 1}
-
-print("모델과 디코더 토크나이저의 동기화가 제대로 되어 있습니다!")
+root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
+Using device: cuda
+You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
+{'input_ids': tensor([[    2,  2539,  4167,  ...,     0,     0,     0],
+        [    2, 24094,  5017,  ...,     0,     0,     0],
+        [    2,   591,  1871,  ...,     0,     0,     0],
+        ...,
+        [    2,  2003,  4793,  ...,     0,     0,     0],
+        [    2, 21939, 10400,  ...,     0,     0,     0],
+        [    2,  8509,  8295,  ...,     0,     0,     0]], device='cuda:0'), 'attention_mask': tensor([[1, 1, 1,  ..., 0, 0, 0],
+        [1, 1, 1,  ..., 0, 0, 0],
+        [1, 1, 1,  ..., 0, 0, 0],
+        ...,
+        [1, 1, 1,  ..., 0, 0, 0],
+        [1, 1, 1,  ..., 0, 0, 0],
+        [1, 1, 1,  ..., 0, 0, 0]], device='cuda:0'), 'labels': tensor([[    2,  2539,  4167,  ...,  -100,  -100,  -100],
+        [    2, 24094,  5017,  ...,  -100,  -100,  -100],
+        [    2,   591,  1808,  ...,  -100,  -100,  -100],
+        ...,
+        [    2,  2003,  4793,  ...,  -100,  -100,  -100],
+        [    2, 21939, 10400,  ...,  -100,  -100,  -100],
+        [    2,  8509,  8295,  ...,  -100,  -100,  -100]], device='cuda:0')}
+Traceback (most recent call last):
+  File "/workspace/sentence/src/check.py", line 48, in <module>
+    assert valid_labels.max().item() < model.dec_tok.vocab_size  # 패딩 제외하고 최대값이 vocab_size보다 작은지 확인
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
