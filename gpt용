@@ -1,33 +1,77 @@
-root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
-Using device: cuda
-You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
-{'input_ids': tensor([[    2,  8614,  8097,  ...,     0,     0,     0],
-        [    2,  8762,  8295,  ...,     0,     0,     0],
-        [    2,  1652,  4777,  ...,     0,     0,     0],
-        ...,
-        [    2, 14808,  4050,  ...,     0,     0,     0],
-        [    2, 10508,  4012,  ...,     0,     0,     0],
-        [    2,  2548,   654,  ...,     0,     0,     0]], device='cuda:0'), 'attention_mask': tensor([[1, 1, 1,  ..., 0, 0, 0],
-        [1, 1, 1,  ..., 0, 0, 0],
-        [1, 1, 1,  ..., 0, 0, 0],
-        ...,
-        [1, 1, 1,  ..., 0, 0, 0],
-        [1, 1, 1,  ..., 0, 0, 0],
-        [1, 1, 1,  ..., 0, 0, 0]], device='cuda:0'), 'labels': tensor([[    2,  8614,  2769,  ...,  -100,  -100,  -100],
-        [    2,  8762,  3354,  ...,  -100,  -100,  -100],
-        [    2,  1652,  4777,  ...,  -100,  -100,  -100],
-        ...,
-        [    2, 14808,  4050,  ...,  -100,  -100,  -100],
-        [    2, 10508,   291,  ...,  -100,  -100,  -100],
-        [    2,  2548,   654,  ...,  -100,  -100,  -100]], device='cuda:0'), 'decoder_input_ids': tensor([[    2,  8614,  8097,  ...,     0,     0,     0],
-        [    2,  8762,  8295,  ...,     0,     0,     0],
-        [    2,  1652,  4777,  ...,     0,     0,     0],
-        ...,
-        [    2, 14808,  4050,  ...,     0,     0,     0],
-        [    2, 10508,  4012,  ...,     0,     0,     0],
-        [    2,  2548,   654,  ...,     0,     0,     0]], device='cuda:0')}
-Traceback (most recent call last):
-  File "/workspace/sentence/src/check.py", line 56, in <module>
-    assert batch["decoder_input_ids"][:, 0].eq(model.dec_tok.bos_token_id).all()  # BOS token 확인
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-AssertionError
+# GrammarCorrectionDataset 수정
+class GrammarCorrectionDataset(Dataset):
+    def __init__(self, data_dir, tokenizer_name="beomi/kcbert-base", max_length=512, stride=64):  
+        self.tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
+        self.max_length = max_length
+        self.stride = stride
+        self.examples = []  
+
+        files = [f for f in os.listdir(data_dir) if f.endswith(".json")]
+
+        for fname in files:
+            path = os.path.join(data_dir, fname)
+            try:
+                with open(path, encoding="utf-8-sig") as f:
+                    data = json.load(f)
+
+                    seq = data if isinstance(data, list) else [data] 
+
+                    for item in seq:
+                        if not isinstance(item, dict):
+                            continue
+                        src = item.get("ko")
+                        tgt = item.get("corrected")
+
+                        if not (isinstance(src, str) and isinstance(tgt, str)):
+                            continue
+                        src, tgt = src.strip(), tgt.strip()
+                        if not (src and tgt):
+                            continue
+
+                        # 슬라이딩 윈도우 토큰화
+                        src_chunks = self.tokenizer(
+                            src,
+                            max_length=self.max_length,
+                            truncation=True,
+                            padding="max_length",
+                            stride=self.stride,
+                            return_overflowing_tokens=True,
+                            return_tensors="pt",
+                        )
+                        tgt_chunks = self.tokenizer(
+                            tgt,
+                            max_length=self.max_length,
+                            truncation=True,
+                            padding="max_length",
+                            stride=self.stride,
+                            return_overflowing_tokens=True,
+                            return_tensors="pt",
+                        )
+
+                        # chunk 개수가 다르면 맞춰서 최소값까지만 사용
+                        n = min(src_chunks["input_ids"].size(0), tgt_chunks["input_ids"].size(0))
+                        for i in range(n):
+                            input_ids = src_chunks["input_ids"][i]
+                            attention_mask = src_chunks["attention_mask"][i]
+                            labels = tgt_chunks["input_ids"][i].clone()
+                            labels[labels == self.tokenizer.pad_token_id] = -100  # 패딩 무시
+
+                            # decoder_input_ids를 input_ids로 설정하고 첫 번째 토큰을 bos_token_id로 수정
+                            decoder_input_ids = input_ids.clone()
+                            decoder_input_ids[0] = self.tokenizer.bos_token_id  # 첫 번째 토큰을 bos_token_id로 설정
+
+                            self.examples.append({
+                                "input_ids": input_ids,
+                                "attention_mask": attention_mask,
+                                "labels": labels,
+                                "decoder_input_ids": decoder_input_ids,  # 수정된 부분
+                            })
+
+            except Exception as e:
+                print(f"Error loading {fname}: {e}")
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[idx]
