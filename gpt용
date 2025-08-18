@@ -1,7 +1,35 @@
-root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
-Traceback (most recent call last):
-  File "/workspace/sentence/src/check.py", line 2, in <module>
-    assert model.config.pad_token_id == model.dec_tok.pad_token_id
-           ^^^^^
-NameError: name 'model' is not defined
-root@986d73f0cf4d:/workspace/sentence/src# 
+# check.py
+import torch
+from model import CorrectionModel  # model.py에서 CorrectionModel을 임포트
+from torch.utils.data import DataLoader  # 데이터 로딩을 위한 모듈
+from transformers import T5TokenizerFast  # 디코더 토크나이저 로딩을 위한 모듈
+
+# 디코더 토크나이저 로딩 (SPM 모델 경로 수정)
+dec_tok = T5TokenizerFast(vocab_file="../spm_out/tokenizer_24k.model", extra_ids=0)
+
+# 모델 로딩 (디코더 토크나이저를 넘겨줌)
+model = CorrectionModel(
+    encoder_name="beomi/kcbert-base",
+    num_decoder_layers=6,
+    decoder_tokenizer=dec_tok,  # 디코더 토크나이저 인스턴스를 전달
+)
+
+# DataLoader 준비 (디코더 토크나이저가 사용된 Dataset이어야 합니다)
+# train_loader는 이미 Dataset이 정의된 상태에서 사용해야 합니다.
+train_loader = DataLoader(...)
+
+# 모델-디코더 토크나이저 동기화 확인
+assert model.config.pad_token_id == model.dec_tok.pad_token_id
+assert model.config.eos_token_id == model.dec_tok.eos_token_id
+assert model.config.decoder_start_token_id == getattr(model.dec_tok, "bos_token_id", None)
+
+# 출력 차원 vs Vocab 크기 일치 확인
+assert model.output_projection.out_features == model.dec_tok.vocab_size
+
+# 배치 검사 (DataLoader에서 하나 뽑아서 확인)
+batch = next(iter(train_loader))
+assert batch["labels"].max().item() < model.dec_tok.vocab_size
+assert batch["decoder_input_ids"][:, 0].eq(model.dec_tok.bos_token_id).all()
+assert set(batch["decoder_attention_mask"].unique().tolist()) <= {0, 1}
+
+print("모델과 디코더 토크나이저의 동기화가 제대로 되어 있습니다!")
