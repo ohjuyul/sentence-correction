@@ -1,26 +1,15 @@
-Loaded TX_ST_2_100007-522-4-24.json with 8 items.
-Error loading TX_ST_2_100007-522-4-24.json: can't assign a NoneType to a torch.LongTensor
-Loaded TX_CA_2_100007-67-21-36.json with 8 items.
-Error loading TX_CA_2_100007-67-21-36.json: can't assign a NoneType to a torch.LongTensor
-Loaded TX_ES_2_100007-549-12-12.json with 8 items.
-Error loading TX_ES_2_100007-549-12-12.json: can't assign a NoneType to a torch.LongTensor
-Loaded TX_ST_3_100008-98-23-32.json with 8 items.
-Error loading TX_ST_3_100008-98-23-32.json: can't assign a NoneType to a torch.LongTensor
-Loaded TX_SH_2_100007-305-33-43.json with 8 items.
-Error loading TX_SH_2_100007-305-33-43.json: can't assign a NoneType to a torch.LongTensor
-Loaded TX_SH_2_100007-135-37-34.json with 8 items.
-Error loading TX_SH_2_100007-135-37-34.json: can't assign a NoneType to a torch.LongTensor
-Loaded TX_ST_3_100007-324-9-1.json with 8 items.
-Error loading TX_ST_3_100007-324-9-1.json: can't assign a NoneType to a torch.LongTensor
-Loaded TX_ES_3_100008-544-4-30.json with 8 items.
-Error loading TX_ES_3_100008-544-4-30.json: can't assign a NoneType to a torch.LongTensor
-Traceback (most recent call last):
-  File "/workspace/sentence/src/check.py", line 28, in <module>
-    train_loader = DataLoader(dataset, batch_size=8, shuffle=True)
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataloader.py", line 385, in __init__
-    sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/sampler.py", line 156, in __init__
-    raise ValueError(
-ValueError: num_samples should be a positive integer value, but got num_samples=0
+{
+    "id": "100008-1-4-12",
+    "fileName": "TX_CA_1_100008-1-4-12",
+    "dataSet": "한국어 철자 및 맞춤법 교정용 병렬 데이터",
+    "domain": "CA",
+    "ko": "난 신혼여행으로 갔다왔는데 프라하가 제일 좋았어.",
+    "corrected": "난 신혼여행으로 갔다 왔는데 프라하가 제일 좋았어.",
+    "error": [
+        {
+            "errorType": "spac",
+            "startPoint": 9,
+            "endPoint": 14
+        }
+    ]
+}
