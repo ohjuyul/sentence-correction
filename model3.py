@@ -257,6 +257,8 @@ class BartDecoderLayer(nn.Module):
 
 # --- BartDecoder ---
 
+# --- BartDecoder --- (계속)
+
 class BartDecoder(nn.Module):
     def __init__(self, config: PretrainedConfig, embed_tokens: Optional[nn.Embedding] = None):
         super().__init__()
@@ -283,26 +285,26 @@ class BartDecoder(nn.Module):
         self.embed_tokens = value
 
     def _update_causal_mask(self, attention_mask, inputs_embeds, cache_position, self_attn_cache):
-    seq_len = attention_mask.size(1)
+        seq_len = attention_mask.size(1)  # 시퀀스 길이
 
-    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attention_mask.device), diagonal=1)
-    causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))  # [L, L]
+        # causal mask 생성 (상삼각 행렬)
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attention_mask.device), diagonal=1)
+        causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))  # [L, L]
 
-    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, L, L]
-    # attention_mask: 1(토큰) / 0(pad) → additive(-inf/0)로 변환
-    pad = (1 - attention_mask).to(dtype=inputs_embeds.dtype) * float('-inf')  # Changed
-    pad = pad.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]  # Changed
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, L, L]
+        # attention_mask: 1(토큰) / 0(pad) → additive(-inf/0)로 변환
+        pad = (1 - attention_mask).to(dtype=inputs_embeds.dtype) * float('-inf')  # Changed
+        pad = pad.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]  # Changed
 
-    combined_mask = causal_mask + pad  # [B, 1, L, L]  # Changed
-    return combined_mask
-
+        combined_mask = causal_mask + pad  # [B, 1, L, L]  # Changed
+        return combined_mask
 
     def _update_cross_attn_mask(self, encoder_hidden_states, encoder_attention_mask, input_shape, inputs_embeds):
-    if encoder_attention_mask is None:
-        return None
-    # 1/0 → additive(-inf/0)
-    pad = (1 - encoder_attention_mask).to(dtype=inputs_embeds.dtype) * float('-inf')  # Changed
-    return pad.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]  # Changed
+        if encoder_attention_mask is None:
+            return None
+        # 1/0 → additive(-inf/0)
+        pad = (1 - encoder_attention_mask).to(dtype=inputs_embeds.dtype) * float('-inf')  # Changed
+        return pad.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]  # Changed
 
 
     def forward(
@@ -413,6 +415,7 @@ class BartDecoder(nn.Module):
             attentions=all_self_attns,
             cross_attentions=all_cross_attentions,
         )
+
 
 # --- BartConfig ---
 
