@@ -62,10 +62,14 @@ class GrammarCorrectionDataset(Dataset):
                             labels = tgt_chunks["input_ids"][i].clone()
                             labels[labels == self.tokenizer.pad_token_id] = -100  # 패딩 무시
 
+                            # decoder_input_ids를 input_ids로 설정
+                            decoder_input_ids = input_ids.clone()
+
                             self.examples.append({
                                 "input_ids": input_ids,
                                 "attention_mask": attention_mask,
                                 "labels": labels,
+                                "decoder_input_ids": decoder_input_ids,  # 추가된 부분
                             })
 
             except Exception as e:
