@@ -1,76 +1,21 @@
-class GrammarCorrectionDataset(Dataset):
-    def __init__(self, data_dir, tokenizer_name="beomi/kcbert-base", max_length=512, stride=64):  
-        self.tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
-        self.max_length = max_length
-        self.stride = stride
-        self.examples = []  
-
-        files = [f for f in os.listdir(data_dir) if f.endswith(".json")]
-
-        for fname in files:
-            path = os.path.join(data_dir, fname)
-            try:
-                with open(path, encoding="utf-8-sig") as f:
-                    data = json.load(f)
-
-                    seq = data if isinstance(data, list) else [data] 
-
-                    for item in seq:
-                        if not isinstance(item, dict):
-                            continue
-                        src = item.get("ko")
-                        tgt = item.get("corrected")
-
-                        # 값 검증 추가: None 또는 비어있는 값이 있으면 건너뛰기
-                        if not (isinstance(src, str) and isinstance(tgt, str)) or not src or not tgt:
-                            continue
-
-                        src, tgt = src.strip(), tgt.strip()
-
-                        # 슬라이딩 윈도우 토큰화
-                        src_chunks = self.tokenizer(
-                            src,
-                            max_length=self.max_length,
-                            truncation=True,
-                            padding="max_length",
-                            stride=self.stride,
-                            return_overflowing_tokens=True,
-                            return_tensors="pt",
-                        )
-                        tgt_chunks = self.tokenizer(
-                            tgt,
-                            max_length=self.max_length,
-                            truncation=True,
-                            padding="max_length",
-                            stride=self.stride,
-                            return_overflowing_tokens=True,
-                            return_tensors="pt",
-                        )
-
-                        # chunk 개수가 다르면 맞춰서 최소값까지만 사용
-                        n = min(src_chunks["input_ids"].size(0), tgt_chunks["input_ids"].size(0))
-                        for i in range(n):
-                            input_ids = src_chunks["input_ids"][i]
-                            attention_mask = src_chunks["attention_mask"][i]
-                            labels = tgt_chunks["input_ids"][i].clone()
-                            labels[labels == self.tokenizer.pad_token_id] = -100  # 패딩 무시
-
-                            # decoder_input_ids를 input_ids로 설정하고 첫 번째 토큰을 bos_token_id로 수정
-                            decoder_input_ids = input_ids.clone()
-                            decoder_input_ids[0] = self.tokenizer.bos_token_id  # 첫 번째 토큰을 bos_token_id로 설정
-
-                            self.examples.append({
-                                "input_ids": input_ids,
-                                "attention_mask": attention_mask,
-                                "labels": labels,
-                                "decoder_input_ids": decoder_input_ids,  # 수정된 부분
-                            })
-
-            except Exception as e:
-                print(f"Error loading {fname}: {e}")
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        return self.examples[idx]
+Error loading TX_SH_3_100007-305-31-23.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_CA_1_100008-525-21-23.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_CA_1_100008-647-30-15.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_ST_2_100007-522-4-24.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_CA_2_100007-67-21-36.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_ES_2_100007-549-12-12.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_ST_3_100008-98-23-32.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_SH_2_100007-305-33-43.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_SH_2_100007-135-37-34.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_ST_3_100007-324-9-1.json: can't assign a NoneType to a torch.LongTensor
+Error loading TX_ES_3_100008-544-4-30.json: can't assign a NoneType to a torch.LongTensor
+Traceback (most recent call last):
+  File "/workspace/sentence/src/check.py", line 28, in <module>
+    train_loader = DataLoader(dataset, batch_size=8, shuffle=True)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataloader.py", line 385, in __init__
+    sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/sampler.py", line 156, in __init__
+    raise ValueError(
+ValueError: num_samples should be a positive integer value, but got num_samples=0
