@@ -1,6 +1,7 @@
 import math
 import warnings
 from typing import Optional, Tuple, List, Union, Callable
+from transformers import T5TokenizerFast  # Changed
 
 import torch
 import torch.nn as nn
@@ -282,24 +283,27 @@ class BartDecoder(nn.Module):
         self.embed_tokens = value
 
     def _update_causal_mask(self, attention_mask, inputs_embeds, cache_position, self_attn_cache):
-        seq_len = attention_mask.size(1)  # 시퀀스 길이
+    seq_len = attention_mask.size(1)
 
-        # causal mask 생성 (상삼각 행렬)
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attention_mask.device), diagonal=1)
-        causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))  # [seq_len, seq_len]
+    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attention_mask.device), diagonal=1)
+    causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))  # [L, L]
 
-        # 차원 확장
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-        attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [bsz, 1, 1, seq_len]
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, L, L]
+    # attention_mask: 1(토큰) / 0(pad) → additive(-inf/0)로 변환
+    pad = (1 - attention_mask).to(dtype=inputs_embeds.dtype) * float('-inf')  # Changed
+    pad = pad.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]  # Changed
 
-        # 더하기 (broadcasting)
-        combined_mask = attention_mask + causal_mask  # [bsz, 1, seq_len, seq_len]
-        return combined_mask
+    combined_mask = causal_mask + pad  # [B, 1, L, L]  # Changed
+    return combined_mask
+
 
     def _update_cross_attn_mask(self, encoder_hidden_states, encoder_attention_mask, input_shape, inputs_embeds):
-        if encoder_attention_mask is None:
-            return None
-        return encoder_attention_mask.unsqueeze(1).unsqueeze(2)
+    if encoder_attention_mask is None:
+        return None
+    # 1/0 → additive(-inf/0)
+    pad = (1 - encoder_attention_mask).to(dtype=inputs_embeds.dtype) * float('-inf')  # Changed
+    return pad.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]  # Changed
+
 
     def forward(
         self,
@@ -480,19 +484,47 @@ class BartConfig(PretrainedConfig):
 # --- CorrectionModel ---
 
 class CorrectionModel(nn.Module):
-    def __init__(self, encoder_name="beomi/kcbert-base", num_decoder_layers=6, vocab_size=32000):
+    def __init__(self,
+                 encoder_name="beomi/kcbert-base",
+                 num_decoder_layers=6,
+                 decoder_tokenizer=None,                 # Changed
+                 decoder_spm_path=None):                 # Changed
         super().__init__()
         self.tokenizer = BertTokenizer.from_pretrained(encoder_name)
         self.encoder = BertModel.from_pretrained(encoder_name)
 
+        # --- 디코더 토크나이저 준비 ---
+        if decoder_tokenizer is not None:                # Changed
+            self.dec_tok = decoder_tokenizer            # Changed
+        elif decoder_spm_path is not None:              # Changed
+            self.dec_tok = T5TokenizerFast(vocab_file=decoder_spm_path, extra_ids=0)  # Changed
+        else:
+            raise ValueError("decoder_tokenizer 또는 decoder_spm_path를 지정하세요.")  # Changed
+
+        # 특수토큰 보정(없으면 추가/지정)                                     # Changed
+        if self.dec_tok.pad_token is None: self.dec_tok.add_special_tokens({"pad_token": "<pad>"})  # Changed
+        if getattr(self.dec_tok, "bos_token", None) is None: self.dec_tok.add_special_tokens({"bos_token": "<s>"})  # Changed
+        if self.dec_tok.eos_token is None: self.dec_tok.add_special_tokens({"eos_token": "</s>"})   # Changed
+
+        # --- BartConfig 동기화 ---
         self.config = BartConfig()
         self.config.d_model = self.encoder.config.hidden_size
         self.config.decoder_layers = num_decoder_layers
-        self.config.vocab_size = self.tokenizer.vocab_size
+        self.config.vocab_size = self.dec_tok.vocab_size         # Changed
         self.config.decoder_attention_heads = 12
+
+        # 디코더 특수토큰 ID를 config에 반영                                # Changed
+        self.config.pad_token_id = self.dec_tok.pad_token_id      # Changed
+        self.config.bos_token_id = getattr(self.dec_tok, "bos_token_id", self.config.bos_token_id)  # Changed
+        self.config.eos_token_id = self.dec_tok.eos_token_id      # Changed
+        self.config.decoder_start_token_id = self.config.bos_token_id  # Changed
 
         self.decoder = BartDecoder(self.config)
         self.output_projection = nn.Linear(self.config.d_model, self.config.vocab_size)
+
+        # (권장) 가중치 타이잉                                             # Changed
+        self.output_projection.weight = self.decoder.embed_tokens.weight  # Changed
+
 
     def forward(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask=None):
         encoder_outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
