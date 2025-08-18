@@ -1,23 +1,21 @@
-root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
-You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
-Traceback (most recent call last):
-  File "/workspace/sentence/src/check.py", line 8, in <module>
-    dec_tok = T5TokenizerFast(vocab_file="../spm_out/tokenizer_24k.model", extra_ids=0)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/transformers/models/t5/tokenization_t5_fast.py", line 119, in __init__
-    super().__init__(
-  File "/usr/local/lib/python3.12/dist-packages/transformers/tokenization_utils_fast.py", line 134, in __init__
-    fast_tokenizer = convert_slow_tokenizer(slow_tokenizer)
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py", line 1722, in convert_slow_tokenizer
-    return converter_class(transformer_tokenizer).converted()
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py", line 546, in __init__
-    requires_backends(self, "protobuf")
-  File "/usr/local/lib/python3.12/dist-packages/transformers/utils/import_utils.py", line 1828, in requires_backends
-    raise ImportError("".join(failed))
-ImportError: 
-T5Converter requires the protobuf library but it was not found in your environment. Checkout the instructions on the
-installation page of its repo: https://github.com/protocolbuffers/protobuf/tree/master/python#installation and follow the ones
-that match your environment. Please note that you may need to restart your runtime after installation.
+root@986d73f0cf4d:/workspace/sentence/src# pip install protobuf
+error: externally-managed-environment
 
+× This environment is externally managed
+╰─> To install Python packages system-wide, try apt install
+    python3-xyz, where xyz is the package you are trying to
+    install.
+    
+    If you wish to install a non-Debian-packaged Python package,
+    create a virtual environment using python3 -m venv path/to/venv.
+    Then use path/to/venv/bin/python and path/to/venv/bin/pip. Make
+    sure you have python3-full installed.
+    
+    If you wish to install a non-Debian packaged Python application,
+    it may be easiest to use pipx install xyz, which will manage a
+    virtual environment for you. Make sure you have pipx installed.
+    
+    See /usr/share/doc/python3.12/README.venv for more information.
+
+note: If you believe this is a mistake, please contact your Python installation or OS distribution provider. You can override this, at the risk of breaking your Python installation or OS, by passing --break-system-packages.
+hint: See PEP 668 for the detailed specification.
