@@ -61,8 +61,8 @@ def make_mixed_corpus_from_lists(
 # ------------------------------
 def train_sentencepiece_bpe(
     corpus_txt: str,
-    model_prefix: str = "decoder_spm_bpe24k",
-    vocab_size: int = 24000,
+    model_prefix: str = "tokenizer_32k",
+    vocab_size: int = 32000,
     num_threads: int = 16,
 ) -> Tuple[str, str]:
     spm.SentencePieceTrainer.Train(
@@ -109,7 +109,7 @@ def run_pipeline(
     correct_txt: str = "correct.txt",
     out_dir: str = "spm_out",
     corrected_ratio: float = 0.90,   # 0.80~0.90 권장
-    vocab_size: int = 24000,         # 필요 시 32000
+    vocab_size: int = 32000,         # 필요 시 32000
     valid_ratio: float = 0.10,       # 10% 검증
     seed: int = 42,
     num_threads: int = 16,
@@ -160,7 +160,7 @@ if __name__ == "__main__":
         correct_txt="correct.txt",   # 파일명이 'correcet.txt'라면 그대로 바꿔 넣으세요.
         out_dir="spm_out",
         corrected_ratio=0.90,        # 0.80~0.90 사이로 실험
-        vocab_size=24000,            # 필요시 32000으로 재학습
+        vocab_size=32000,            # 필요시 32000으로 재학습
         valid_ratio=0.10,
         seed=42,
         num_threads=16,
