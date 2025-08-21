@@ -1,86 +1,14 @@
-import os
-import torch
-from torch.utils.data import Dataset
-from transformers import BertTokenizer
+    def forward(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask=None):
+        # decoder_input_ids가 None이면 bos_token_id를 추가하는 작업
+        if decoder_input_ids is None:
+            decoder_input_ids = torch.cat([torch.full((input_ids.size(0), 1), self.config.bos_token_id, device=input_ids.device), input_ids[:, :-1]], dim=1)
 
-class GrammarCorrectionDataset(Dataset):
-    def __init__(self, ko_file, correct_file, tokenizer_name="beomi/kcbert-base", max_length=512, stride=64, limit=None):
-        self.tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
-        self.max_length = max_length
-        self.stride = stride
-        self.examples = []  # 최종 토큰화된 결과 저장
-        self.limit = limit  # limit 추가
+        encoder_outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        memory = encoder_outputs.last_hidden_state
 
-        # 파일 읽기
-        with open(ko_file, 'r', encoding='utf-8') as f_ko, open(correct_file, 'r', encoding='utf-8') as f_correct:
-            self.originals = f_ko.readlines()
-            self.corrected = f_correct.readlines()
-
-        assert len(self.originals) == len(self.corrected), "원본과 정답 파일의 문장 수가 다릅니다."
-
-        # 문장별로 토큰화 및 처리
-        for idx, (src, tgt) in enumerate(zip(self.originals, self.corrected)):
-            # limit 값이 주어졌다면 해당 값만큼 처리
-            if self.limit and idx >= self.limit:
-                break
-
-            src = src.strip()
-            tgt = tgt.strip()
-
-            if not src or not tgt:
-                continue
-
-            # ---- 슬라이딩 윈도우 토큰화 ----
-            src_chunks = self.tokenizer(
-                src,
-                max_length=self.max_length,
-                truncation=True,
-                padding="max_length",
-                stride=self.stride,
-                return_overflowing_tokens=True,
-                return_tensors="pt",
-            )
-            tgt_chunks = self.tokenizer(
-                tgt,
-                max_length=self.max_length,
-                truncation=True,
-                padding="max_length",
-                stride=self.stride,
-                return_overflowing_tokens=True,
-                return_tensors="pt",
-            )
-
-            # chunk 개수가 다르면 맞춰서 최소값까지만 사용
-            n = min(src_chunks["input_ids"].size(0), tgt_chunks["input_ids"].size(0))
-            for i in range(n):
-                input_ids = src_chunks["input_ids"][i]
-                attention_mask = src_chunks["attention_mask"][i]
-                labels = tgt_chunks["input_ids"][i].clone()
-                labels[labels == self.tokenizer.pad_token_id] = -100  # 패딩 무시
-
-                decoder_input_ids = input_ids.clone()
-
-                self.examples.append({
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "labels": labels,
-                    "decoder_input_ids": decoder_input_ids,
-                })
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        return self.examples[idx]
-
-    def get_batches(self, batch_size=8, device='cuda'):
-        """
-        배치 단위로 데이터를 가져와 GPU로 전달하는 함수
-        """
-        for i in range(0, len(self.examples), batch_size):
-            batch = self.examples[i:i+batch_size]
-            
-            # 배치 데이터를 GPU로 이동
-            batch = {key: torch.stack([item[key] for item in batch]).to(device) for key in batch[0]}
-            
-            yield batch
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=memory,
+            encoder_attention_mask=attention_mask,
+        )
