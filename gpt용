@@ -1,12 +1,217 @@
-loader = build_dataset_loader(
-    ko_path=KO_FILE,
-    correct_path=CORRECT_FILE,
-    enc_name=ENCODER_NAME,
-    dec_tok=dec_tok,
-    enc_max_length=ENC_MAX_LENGTH,
-    dec_max_length=DEC_MAX_LENGTH,
-    stride=STRIDE,
-    limit=LIMIT,
-    batch_size=BATCH_SIZE,
-    num_workers=NUM_WORKERS,
-)
+# check.py
+import os
+from typing import Dict
+
+# 포크 이후 tokenizers 병렬 경고/데드락 방지
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import torch
+from torch.utils.data import DataLoader
+from transformers import T5TokenizerFast
+
+from model3 import CorrectionModel
+from data_txt import GrammarCorrectionDataset
+
+
+# ------------------------------
+# 구성 파라미터
+# ------------------------------
+ENCODER_NAME = "beomi/kcbert-base"
+DECODER_SPM_PATH = "../spm_out/tokenizer_32k.model"   # 사용자 SentencePiece 모델
+KO_FILE = "../ko.txt"
+CORRECT_FILE = "../correct.txt"
+
+ENC_MAX_LENGTH = 300   # KC-BERT 최대 포지션(300)
+DEC_MAX_LENGTH = 512   # 디코더는 더 길게 사용 가능
+STRIDE = 64
+LIMIT = 100000
+BATCH_SIZE = 8
+
+# Ubuntu/Linux 권장 설정
+NUM_WORKERS = max(1, (os.cpu_count() or 2) - 1)  # 리눅스에서는 워커>0 권장
+PREFETCH_FACTOR = 4
+PERSISTENT_WORKERS = True
+
+
+# ------------------------------
+# CUDA / 백엔드 튜닝 (선택)
+# ------------------------------
+def tune_backends_for_cuda() -> None:
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cudnn.benchmark = True
+    # Ampere(8.0)+ 에서 TF32 허용
+    try:
+        major, _ = torch.cuda.get_device_capability()
+        if major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
+
+# ------------------------------
+# 유틸 함수
+# ------------------------------
+def ensure_special_tokens(tok: T5TokenizerFast) -> T5TokenizerFast:
+    """디코더 토크나이저의 PAD/BOS/EOS 토큰을 보장합니다."""
+    changed = False
+    if tok.pad_token is None:
+        tok.add_special_tokens({"pad_token": "<pad>"})
+        changed = True
+    if getattr(tok, "bos_token", None) is None:
+        tok.add_special_tokens({"bos_token": "<s>"})
+        changed = True
+    if tok.eos_token is None:
+        tok.add_special_tokens({"eos_token": "</s>"})
+        changed = True
+    if changed:
+        print("[Info] Added missing special tokens to decoder tokenizer.")
+    return tok
+
+
+def build_tokenizer(spm_path: str) -> T5TokenizerFast:
+    """사용자 SPM으로 디코더 토크나이저 로드."""
+    if not os.path.exists(spm_path):
+        raise FileNotFoundError(f"Decoder SPM not found: {spm_path}")
+    tok = T5TokenizerFast(vocab_file=spm_path, extra_ids=0)
+    return ensure_special_tokens(tok)
+
+
+def build_model(encoder_name: str, dec_tok: T5TokenizerFast, device: torch.device) -> CorrectionModel:
+    """KC-BERT 인코더 + 커스텀 디코더 모델 구성."""
+    model = CorrectionModel(
+        encoder_name=encoder_name,
+        num_decoder_layers=6,
+        decoder_tokenizer=dec_tok,
+    )
+    model.to(device)
+    model.eval()
+    return model
+
+
+def build_dataset_loader(
+    ko_path: str,
+    correct_path: str,
+    enc_name: str,
+    dec_tok: T5TokenizerFast,
+    enc_max_length: int,
+    dec_max_length: int,
+    stride: int,
+    limit: int,
+    batch_size: int,
+    num_workers: int,
+) -> DataLoader:
+    """GrammarCorrectionDataset + DataLoader 구성(인코더/디코더 길이 분리)."""
+    dataset = GrammarCorrectionDataset(
+        ko_file=ko_path,
+        correct_file=correct_path,
+        tokenizer_name=enc_name,
+        max_length=enc_max_length,      # 인코더 길이
+        stride=stride,
+        limit=limit,
+        decoder_tokenizer=dec_tok,
+        dec_max_length=dec_max_length,  # 디코더 길이
+    )
+    # num_workers>0일 때만 prefetch/persistent를 넣기 위해 kwargs로 구성
+    loader_kwargs = dict(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    if num_workers > 0:
+        loader_kwargs.update(
+            prefetch_factor=PREFETCH_FACTOR,
+            persistent_workers=PERSISTENT_WORKERS,
+        )
+    return DataLoader(**loader_kwargs)
+
+
+def run_sanity_checks(model: CorrectionModel, batch: Dict[str, torch.Tensor]) -> None:
+    """토크나이저/모델/배치 정합성 점검 + 1 fwd 패스."""
+    dec_tok = model.dec_tok
+
+    # 1) 토큰 ID 정합성 (디코더 기준)
+    assert model.config.pad_token_id == dec_tok.pad_token_id, "pad_token_id mismatch"
+    assert model.config.eos_token_id == dec_tok.eos_token_id, "eos_token_id mismatch"
+    assert model.config.decoder_start_token_id == getattr(dec_tok, "bos_token_id", None), "decoder_start_token_id != bos_token_id"
+
+    # 2) 배치 키 검사
+    required_keys = ["input_ids", "attention_mask", "labels", "decoder_input_ids", "decoder_attention_mask"]
+    for k in required_keys:
+        if k not in batch:
+            raise KeyError(f"Missing key in batch: {k}")
+
+    # 3) 라벨 사전 범위 검사(패딩 -100 제외)
+    labels = batch["labels"]
+    labels_max = labels.masked_fill(labels.eq(-100), 0).max().item()
+    assert labels_max < dec_tok.vocab_size, "labels contain id >= decoder vocab_size"
+
+    # 4) 디코더 입력의 첫 토큰은 BOS
+    bos_id = dec_tok.bos_token_id
+    assert bos_id is not None, "decoder tokenizer must have bos_token_id"
+    assert batch["decoder_input_ids"][:, 0].eq(bos_id).all(), "decoder_input_ids do not start with BOS"
+
+    # 5) 디코더 어텐션 마스크는 0/1로만
+    unique_vals = set(batch["decoder_attention_mask"].unique().tolist())
+    assert unique_vals <= {0, 1}, f"decoder_attention_mask has invalid values: {unique_vals}"
+
+    # 6) 1회 forward 패스 및 출력 차원 검사
+    with torch.no_grad():
+        logits = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            decoder_input_ids=batch["decoder_input_ids"],
+            decoder_attention_mask=batch["decoder_attention_mask"],
+        )
+    assert logits.shape[:2] == batch["decoder_input_ids"].shape, "logits length != decoder_input length"
+    assert logits.size(-1) == dec_tok.vocab_size, "logits vocab dim != decoder vocab_size"
+
+    # 7) 간단 출력
+    print(f"[OK] BOS id: {bos_id}")
+    print(f"[OK] First tokens of decoder_input_ids: {batch['decoder_input_ids'][:, 0].tolist()}")
+    print("[OK] Model & decoder tokenizer are in sync. Single forward pass succeeded.")
+
+
+# ------------------------------
+# Main
+# ------------------------------
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Info] Using device: {device}")
+
+    tune_backends_for_cuda()
+
+    # 디코더 토크나이저
+    dec_tok = build_tokenizer(DECODER_SPM_PATH)
+    print(f"[Info] Decoder vocab size: {dec_tok.vocab_size}")
+    print(f"[Info] PAD/BOS/EOS = {dec_tok.pad_token_id}/{getattr(dec_tok, 'bos_token_id', None)}/{dec_tok.eos_token_id}")
+
+    # 모델
+    model = build_model(ENCODER_NAME, dec_tok, device)
+
+    # 데이터로더 (키워드 인자만 사용)
+    loader = build_dataset_loader(
+        ko_path=KO_FILE,
+        correct_path=CORRECT_FILE,
+        enc_name=ENCODER_NAME,
+        dec_tok=dec_tok,
+        enc_max_length=ENC_MAX_LENGTH,
+        dec_max_length=DEC_MAX_LENGTH,
+        stride=STRIDE,
+        limit=LIMIT,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+    )
+
+    # 배치 하나만 테스트
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        run_sanity_checks(model, batch)
+        break
+
+
+if __name__ == "__main__":
+    main()
