@@ -1,5 +1,12 @@
-root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
-  File "/workspace/sentence/src/check.py", line 200
-    )
-    ^
-SyntaxError: positional argument follows keyword argument
+loader = build_dataset_loader(
+    ko_path=KO_FILE,
+    correct_path=CORRECT_FILE,
+    enc_name=ENCODER_NAME,
+    dec_tok=dec_tok,
+    enc_max_length=ENC_MAX_LENGTH,
+    dec_max_length=DEC_MAX_LENGTH,
+    stride=STRIDE,
+    limit=LIMIT,
+    batch_size=BATCH_SIZE,
+    num_workers=NUM_WORKERS,
+)
