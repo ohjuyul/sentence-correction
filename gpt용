@@ -1,5 +1,5 @@
 # train_full_split.py
-# 2.23M 스트리밍 + 8:1:1 분할 + tqdm + 에폭별 val(loss/acc) + EarlyStopping(patience=3)
+# 2.23M 스트리밍 + 8:1:1 분할 + tqdm + 에폭별 val(loss/acc/CER) + EarlyStopping(patience=3)
 # 디코더 우선 학습 → plateau 시 인코더 점진적 언프리즈(뒤에서부터 k층씩)
 
 import os
@@ -58,10 +58,14 @@ ES_PATIENCE_EP = 3            # 연속 N 에폭 개선 없으면 중단
 
 # ========= 저장/로그 =========
 CKPT_DIR   = "./checkpoints"
-LOG_EVERY  = 100                   # step
+LOG_EVERY  = 100                   # step (에폭 로그만 쓰려면 아래 LOG_EVERY 블록은 주석 처리된 상태 유지)
 MILESTONE_EVERY_EPOCHS = 3         # 3에폭마다 마일스톤 저장
 SAVE_EVERY_STEPS = 20_000          # (옵션) 스텝 주기 저장
 os.makedirs(CKPT_DIR, exist_ok=True)
+
+# ========= 평가 옵션 =========
+# CER 속도 위해 캡 (0이면 전체 샘플 CER 계산)
+EVAL_CER_MAX_SAMPLES = 5_000
 
 IGNORE_INDEX = -100
 
@@ -293,9 +297,41 @@ def is_better(curr, best):
 
 
 # --------------------------
+# 평가 헬퍼 (ids→텍스트, CER)
+# --------------------------
+def ids_to_text(dec_tok, ids: torch.Tensor, pad_id: int, eos_id: int) -> str:
+    arr = ids.detach().cpu().tolist()
+    arr = [pad_id if t == IGNORE_INDEX else t for t in arr]
+    if eos_id in arr:
+        cut = arr.index(eos_id) + 1  # eos 포함 후 디코드
+        arr = arr[:cut]
+    return dec_tok.decode(arr, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+def cer_one(ref: str, hyp: str) -> float:
+    R, H = ref, hyp
+    n, m = len(R), len(H)
+    if n == 0:
+        return float(m > 0)
+    dp = [[0]*(m+1) for _ in range(n+1)]
+    for i in range(n+1):
+        dp[i][0] = i
+    for j in range(m+1):
+        dp[0][j] = j
+    for i in range(1, n+1):
+        ri = R[i-1]
+        for j in range(1, m+1):
+            hj = H[j-1]
+            dp[i][j] = min(
+                dp[i-1][j] + 1,
+                dp[i][j-1] + 1,
+                dp[i-1][j-1] + (ri != hj)
+            )
+    return dp[n][m] / max(1, n)
+
+
+# --------------------------
 # 평가 루프 (teacher-forced)
-#   - loss
-#   - token accuracy (pad 제외)
+#   - loss / token accuracy / CER(opt)
 # --------------------------
 @torch.no_grad()
 def evaluate(model: CorrectionModel, loader: DataLoader, device) -> Dict[str, float]:
@@ -303,6 +339,12 @@ def evaluate(model: CorrectionModel, loader: DataLoader, device) -> Dict[str, fl
     total_loss = 0.0
     total_tok  = 0
     total_cor  = 0
+    total_cer  = 0.0
+    n_cer      = 0
+
+    dec_tok  = model.dec_tok
+    pad_id   = dec_tok.pad_token_id
+    eos_id   = dec_tok.eos_token_id
 
     for batch in tqdm(loader, desc="Validate/Test", leave=False):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -316,16 +358,27 @@ def evaluate(model: CorrectionModel, loader: DataLoader, device) -> Dict[str, fl
         loss = criterion(logits, batch["labels"]).item()
         total_loss += loss
 
-        # token-level accuracy (ignore -100)
-        preds = logits.argmax(-1)              # (B,T)
-        golds = batch["labels"]                # (B,T)
+        preds = logits.argmax(-1)     # (B,T)
+        golds = batch["labels"]       # (B,T)
         mask  = golds.ne(IGNORE_INDEX)
         total_tok += mask.sum().item()
         total_cor += (preds.eq(golds) & mask).sum().item()
 
+        # CER (cap 적용)
+        if EVAL_CER_MAX_SAMPLES == 0 or n_cer < EVAL_CER_MAX_SAMPLES:
+            B = preds.size(0)
+            for b in range(B):
+                if EVAL_CER_MAX_SAMPLES and n_cer >= EVAL_CER_MAX_SAMPLES:
+                    break
+                hyp_text  = ids_to_text(dec_tok, preds[b], pad_id, eos_id)
+                gold_text = ids_to_text(dec_tok, golds[b], pad_id, eos_id)
+                total_cer += cer_one(gold_text, hyp_text)
+                n_cer     += 1
+
     avg_loss = total_loss / max(1, len(loader))
     acc = (total_cor / max(1, total_tok)) if total_tok > 0 else 0.0
-    return {"loss": avg_loss, "acc": acc}
+    avg_cer = (total_cer / max(1, n_cer)) if n_cer > 0 else 0.0
+    return {"loss": avg_loss, "acc": acc, "cer": avg_cer}
 
 
 # --------------------------
@@ -381,9 +434,12 @@ def main():
     for epoch in range(EPOCHS):
         # ===== Train =====
         model.train()
-        running = 0.0
         pbar = tqdm(total=steps_tr_ep, desc=f"Epoch {epoch+1}/{EPOCHS} [train]", leave=True)
         accum = 0
+
+        # 에폭 평균용 누산기 (optimizer step 기준)
+        running_loss = 0.0
+        running_steps = 0
 
         # 매 epoch마다 새 iterator 필요(IterableDataset)
         train_iter = iter(train_loader)
@@ -422,9 +478,12 @@ def main():
                 state.global_step += 1
                 accum = 0
 
-                # EMA/로그
+                # === optimizer step 시점에만 누적
                 l = loss.item() * ACCUM_STEPS
-                running += l
+                running_loss += l
+                running_steps += 1
+
+                # EMA
                 if state.ema_loss is None:
                     state.ema_loss = l
                 else:
@@ -435,11 +494,11 @@ def main():
                 pbar.update(1)
                 pbar.set_postfix({"loss": f"{l:.2f}", "ema": f"{state.ema_loss:.2f}", "lr": f"{lr_now:.2e}", "unfrz": state.unfrozen_layers})
 
-                if state.global_step % LOG_EVERY == 0:
-                    avg = running / LOG_EVERY
-                    print(f"[train] ep {epoch+1} step {state.global_step} | avg_loss {avg:.4f} | ema {state.ema_loss:.4f} | lr {lr_now:.2e} | unfrz {state.unfrozen_layers}")
-                    running = 0.0
+                # (선택) 스텝 100당 로그가 필요하면 이 블록을 주석 해제
+                # if state.global_step % LOG_EVERY == 0:
+                #     print(f"[train] ep {epoch+1} step {state.global_step} | loss {l:.4f} | ema {state.ema_loss:.4f} | lr {lr_now:.2e} | unfrz {state.unfrozen_layers}")
 
+                # (옵션) SAVE_EVERY_STEPS
                 if SAVE_EVERY_STEPS and state.global_step % SAVE_EVERY_STEPS == 0:
                     save_ckpt(model, "autosave", state.global_step)
 
@@ -459,9 +518,14 @@ def main():
 
         pbar.close()
 
+        # ===== Train epoch 평균 로그 (에폭당 1회) =====
+        train_avg_loss = running_loss / max(1, running_steps)
+        lr_now = optimizer.param_groups[2]["lr"]
+        print(f"[train] epoch {epoch+1} | avg_loss {train_avg_loss:.4f} | ema {state.ema_loss:.4f} | lr {lr_now:.2e} | unfrz {state.unfrozen_layers}")
+
         # ===== Validate =====
         val_metrics = evaluate(model, val_loader, device)
-        print(f"[val] epoch {epoch+1} | loss {val_metrics['loss']:.4f} | acc {val_metrics['acc']*100:.2f}%")
+        print(f"[val] epoch {epoch+1} | loss {val_metrics['loss']:.4f} | acc {val_metrics['acc']*100:.2f}% | cer {val_metrics['cer']:.4f}")
 
         # 에폭마다 저장 + 3에폭마다 마일스톤 저장
         save_ckpt(model, f"epoch{epoch+1}", state.global_step)
@@ -470,8 +534,10 @@ def main():
 
         # ===== Early Stopping 판단 =====
         monitor_value = val_metrics["loss"] if ES_MONITOR == "val_loss" else val_metrics["acc"]
-        # 개선 여부
-        better = is_better(monitor_value + (0 if ES_MONITOR=="val_loss" else 0), es.best_metric + (ES_MIN_DELTA if ES_MONITOR=="val_loss" else -ES_MIN_DELTA))
+        better = is_better(
+            monitor_value + (0 if ES_MONITOR=="val_loss" else 0),
+            es.best_metric + (ES_MIN_DELTA if ES_MONITOR=="val_loss" else -ES_MIN_DELTA)
+        )
         if better:
             es.best_metric = monitor_value
             es.best_epoch = epoch + 1
@@ -485,7 +551,7 @@ def main():
 
     # ===== Test (마지막) =====
     test_metrics = evaluate(model, test_loader, device)
-    print(f"[test] loss {test_metrics['loss']:.4f} | acc {test_metrics['acc']*100:.2f}%")
+    print(f"[test] loss {test_metrics['loss']:.4f} | acc {test_metrics['acc']*100:.2f}% | cer {test_metrics['cer']:.4f}")
     print("[Done]")
 
 if __name__ == "__main__":
