@@ -1,41 +1,50 @@
-# check.py  (Streaming Dataset에 맞춘 버전)
+# train_sanity.py
 import os
-from typing import Dict
-
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+from typing import Dict, Tuple
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import T5TokenizerFast
+from transformers import T5TokenizerFast, get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 
 from model3 import CorrectionModel
-from data_txt_stream import GrammarCorrectionDataset  # ← 지금의 Streaming/IterableDataset
+from data_txt_stream import GrammarCorrectionDataset  # ← Streaming / IterableDataset 버전
 
 
-# ------------------------------
-# 구성 파라미터
-# ------------------------------
+# =============================
+# 구성 (경로/모델/토크나이저)
+# =============================
 ENCODER_NAME = "beomi/kcbert-base"
 DECODER_SPM_PATH = "../spm_out/tokenizer_32k.model"
 KO_FILE = "../ko.txt"
 CORRECT_FILE = "../correct.txt"
 
-# 스트리밍에서는 STRIDE=0 권장, LIMIT로 에폭 크기 통제
+# 길이/윈도우 (스트리밍에선 STRIDE=0 권장)
 ENC_MAX_LENGTH = 192
 DEC_MAX_LENGTH = 256
 STRIDE = 0
-LIMIT = 2048          # 배치 256 * 8스텝 정도의 소량만 확인
-BATCH_SIZE = 8
 
-# 초기엔 안전하게 num_workers=0 → 안정화 후 2~4로 올리기
-NUM_WORKERS = 0
-PREFETCH_FACTOR = 2   # num_workers>0일 때만 의미
-PERSISTENT_WORKERS = False
+# 데이터/학습 파라미터
+BATCH_SIZE = 4
+NUM_WORKERS = 0                 # 먼저 0으로 안전 실행 → 안정화 후 2~4로 올리기
+LIMIT = 50_000                  # 에폭당 사용하는 샘플 수 (None이면 파일 끝까지)
+DOWNSAMPLE_PROB = 1.0           # 0.2라면 20% 확률 샘플링
+
+LR = 3e-4
+WEIGHT_DECAY = 0.01
+NUM_WARMUP_STEPS = 500
+TOTAL_TRAIN_STEPS = 10_000      # 스케줄러 총 스텝(필요시 조정)
+USE_COSINE = True
+GRAD_CLIP_NORM = 1.0
+LABEL_SMOOTHING = 0.1
+ACCUM_STEPS = 1                 # 2~4로 늘리면 메모리 여유↑
+SANITY_BATCHES = 200            # 빠른 확인용. 더 보려면 크게.
 
 
-# ------------------------------
-# 유틸
-# ------------------------------
+# =============================
+# 토크나이저
+# =============================
 def ensure_special_tokens(tok: T5TokenizerFast) -> T5TokenizerFast:
     changed = False
     if tok.pad_token is None:
@@ -49,130 +58,231 @@ def ensure_special_tokens(tok: T5TokenizerFast) -> T5TokenizerFast:
     return tok
 
 
-def build_tokenizer(spm_path: str) -> T5TokenizerFast:
+def build_decoder_tokenizer(spm_path: str, legacy: bool = False) -> T5TokenizerFast:
     if not os.path.exists(spm_path):
         raise FileNotFoundError(f"Decoder SPM not found: {spm_path}")
-    tok = T5TokenizerFast(vocab_file=spm_path, extra_ids=0, legacy=False)
+    tok = T5TokenizerFast(vocab_file=spm_path, extra_ids=0, legacy=legacy)
     return ensure_special_tokens(tok)
 
 
-def build_model(encoder_name: str, dec_tok: T5TokenizerFast, device: torch.device) -> CorrectionModel:
-    model = CorrectionModel(
-        encoder_name=encoder_name,
-        num_decoder_layers=6,
-        decoder_tokenizer=dec_tok,
-    )
-    model.to(device)
-    model.eval()
-    return model
-
-
-def build_dataset_loader(
-    ko_path: str,
-    correct_path: str,
-    enc_name: str,
+# =============================
+# 데이터로더 (Streaming)
+# =============================
+def build_loader(
     dec_tok: T5TokenizerFast,
-    enc_max_length: int,
-    dec_max_length: int,
-    stride: int,
-    limit: int,
     batch_size: int,
     num_workers: int,
 ) -> DataLoader:
     dataset = GrammarCorrectionDataset(
-        ko_file=ko_path,
-        correct_file=correct_path,
-        tokenizer_name=enc_name,
-        max_length=enc_max_length,
-        stride=stride,                 # ← 0 권장
-        limit=limit,                   # ← 에폭당 샘플 수
+        ko_file=KO_FILE,
+        correct_file=CORRECT_FILE,
+        tokenizer_name=ENCODER_NAME,
+        max_length=ENC_MAX_LENGTH,     # 인코더 길이
+        stride=STRIDE,                 # 스트리밍에선 0 권장
+        limit=LIMIT,                   # 에폭당 사용할 샘플 수
         decoder_tokenizer=dec_tok,
-        dec_max_length=dec_max_length,
-        downsample_prob=1.0,
+        dec_max_length=DEC_MAX_LENGTH, # 디코더 길이
+        downsample_prob=DOWNSAMPLE_PROB,
     )
-    kwargs = dict(
+    # IterableDataset → shuffle=False
+    return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
-        shuffle=False,                 # ★ IterableDataset는 shuffle 금지
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
     )
-    if num_workers > 0:
-        kwargs.update(prefetch_factor=PREFETCH_FACTOR, persistent_workers=PERSISTENT_WORKERS)
-    return DataLoader(**kwargs)
 
 
-def run_sanity_checks(model: CorrectionModel, batch: Dict[str, torch.Tensor]) -> None:
-    dec_tok = model.dec_tok
+# =============================
+# 모델/옵티마이저/스케줄러
+# =============================
+def build_model(dec_tok: T5TokenizerFast, device: torch.device) -> CorrectionModel:
+    model = CorrectionModel(
+        encoder_name=ENCODER_NAME,
+        num_decoder_layers=6,
+        decoder_tokenizer=dec_tok,
+    )
+    model.to(device)
+    return model
 
-    # 1) 토큰 ID 정합성 (디코더 기준)
-    assert model.config.pad_token_id == dec_tok.pad_token_id, "pad_token_id mismatch"
-    assert model.config.eos_token_id == dec_tok.eos_token_id, "eos_token_id mismatch"
-    assert model.config.decoder_start_token_id == getattr(dec_tok, "bos_token_id", None), "decoder_start_token_id != bos_token_id"
 
-    # 2) 배치 키 검사
-    required_keys = ["input_ids", "attention_mask", "labels", "decoder_input_ids", "decoder_attention_mask"]
-    for k in required_keys:
-        if k not in batch:
-            raise KeyError(f"Missing key in batch: {k}")
+def build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(nd in n for nd in ["bias", "LayerNorm.weight", "layer_norm.weight", "layernorm.weight"]):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return torch.optim.AdamW(
+        [{"params": decay, "weight_decay": weight_decay},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=lr, betas=(0.9, 0.98), eps=1e-8
+    )
 
-    # 3) 라벨 범위 검사(패딩 -100 제외)
-    labels = batch["labels"]
-    labels_max = labels.masked_fill(labels.eq(-100), 0).max().item()
-    assert labels_max < dec_tok.vocab_size, "labels contain id >= decoder vocab_size"
 
-    # 4) 디코더 입력의 첫 토큰은 BOS
-    bos_id = dec_tok.bos_token_id
-    assert bos_id is not None, "decoder tokenizer must have bos_token_id"
-    assert batch["decoder_input_ids"][:, 0].eq(bos_id).all(), "decoder_input_ids do not start with BOS"
+def build_scheduler(optimizer, total_steps: int, warmup_steps: int, use_cosine: bool=True):
+    if use_cosine:
+        return get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    else:
+        return get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    # 5) 디코더 마스크 0/1
-    unique_vals = set(batch["decoder_attention_mask"].unique().tolist())
-    assert unique_vals <= {0, 1}, f"decoder_attention_mask has invalid values: {unique_vals}"
 
-    # 6) 1회 forward 및 출력 차원 검사
-    with torch.no_grad():
+# =============================
+# 손실 함수
+# =============================
+class LabelSmoothingCE(nn.Module):
+    def __init__(self, smoothing: float, ignore_index: int = -100, vocab_size: int = None):
+        super().__init__()
+        self.smoothing = smoothing
+        self.ignore_index = ignore_index
+        self.vocab_size = vocab_size
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # logits: (B, T, V), targets: (B, T)
+        B, T, V = logits.shape
+        assert targets.shape == (B, T)
+        pad_mask = targets.eq(self.ignore_index)
+        n_valid = (~pad_mask).sum().clamp_min(1)
+
+        if self.smoothing > 0.0:
+            log_probs = torch.log_softmax(logits, dim=-1)
+            nll_loss = -log_probs.gather(dim=-1, index=targets.masked_fill(pad_mask, 0).unsqueeze(-1)).squeeze(-1)
+            nll_loss = nll_loss.masked_fill(pad_mask, 0.0).sum() / n_valid
+
+            smooth_loss = -log_probs.mean(dim=-1)
+            smooth_loss = smooth_loss.masked_fill(pad_mask, 0.0).sum() / n_valid
+
+            return (1 - self.smoothing) * nll_loss + self.smoothing * smooth_loss
+        else:
+            loss_fct = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
+            return loss_fct(logits.view(B*T, V), targets.view(B*T))
+
+
+def compute_loss(logits: torch.Tensor, labels: torch.Tensor, smoothing: float, vocab_size: int) -> torch.Tensor:
+    return LabelSmoothingCE(smoothing=smoothing, ignore_index=-100, vocab_size=vocab_size)(logits, labels)
+
+
+# =============================
+# 학습 루틴 (AMP 최신 문법 / 스케줄러 순서 fix)
+# =============================
+def train_step(
+    model: CorrectionModel,
+    batch: Dict[str, torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    scheduler,
+    device: torch.device,
+    smoothing: float,
+    grad_clip_norm: float,
+    accum_steps: int,
+    step_idx: int,
+    global_opt_steps: int,
+) -> Tuple[float, bool, int]:
+    model.train()
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
         logits = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             decoder_input_ids=batch["decoder_input_ids"],
             decoder_attention_mask=batch["decoder_attention_mask"],
         )
-    assert logits.shape[:2] == batch["decoder_input_ids"].shape, "logits length != decoder_input length"
-    assert logits.size(-1) == dec_tok.vocab_size, "logits vocab dim != decoder vocab_size"
+        loss = compute_loss(logits, batch["labels"], smoothing, vocab_size=model.dec_tok.vocab_size)
+        loss = loss / accum_steps
 
-    print(f"[OK] BOS id: {bos_id}")
-    print(f"[OK] First tokens of decoder_input_ids: {batch['decoder_input_ids'][:, 0].tolist()}")
-    print("[OK] Model & decoder tokenizer are in sync. Single forward pass succeeded.")
+    scaler.scale(loss).backward()
+
+    did_step = False
+    if (step_idx + 1) % accum_steps == 0:
+        if grad_clip_norm is not None and grad_clip_norm > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
+        # 1) optimizer.step
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        did_step = True
+
+        # 2) scheduler.step  (optimizer.step 이후에 호출)
+        if scheduler is not None:
+            scheduler.step()
+
+        global_opt_steps += 1
+
+    return loss.item() * accum_steps, did_step, global_opt_steps
 
 
+def train_one_epoch(
+    model: CorrectionModel,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    device: torch.device,
+    smoothing: float,
+    grad_clip_norm: float,
+    accum_steps: int,
+    sanity_batches: int,
+) -> None:
+    scaler = torch.amp.GradScaler(device="cuda", enabled=torch.cuda.is_available())
+    running = 0.0
+    count = 0
+    opt_steps = 0
+
+    for step_idx, batch in enumerate(loader):
+        if step_idx >= sanity_batches:
+            break
+
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        loss_val, did_step, opt_steps = train_step(
+            model, batch, optimizer, scaler, scheduler, device,
+            smoothing, grad_clip_norm, accum_steps, step_idx, opt_steps
+        )
+        running += loss_val
+        count += 1
+
+        if (step_idx + 1) % 10 == 0:
+            avg = running / count
+            # 현재 lr은 optimizer에서 직접 읽는 게 안전 (스케줄러 초반 경고 회피)
+            lr = optimizer.param_groups[0]["lr"]
+            print(f"[step {step_idx+1}] loss(avg): {avg:.4f} | lr: {lr:.2e} | opt-steps: {opt_steps}")
+
+    print(f"[SANITY DONE] steps: {count}, optimizer-steps: {opt_steps}, loss(avg): {running/max(1,count):.4f}")
+
+
+# =============================
+# Main
+# =============================
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Info] Using device: {device}")
 
-    dec_tok = build_tokenizer(DECODER_SPM_PATH)
+    # 디코더 토크나이저/데이터/모델
+    dec_tok = build_decoder_tokenizer(DECODER_SPM_PATH, legacy=False)  # 필요시 legacy=True
     print(f"[Info] Decoder vocab size: {dec_tok.vocab_size}")
     print(f"[Info] PAD/BOS/EOS = {dec_tok.pad_token_id}/{getattr(dec_tok, 'bos_token_id', None)}/{dec_tok.eos_token_id}")
 
-    model = build_model(ENCODER_NAME, dec_tok, device)
-    loader = build_dataset_loader(
-        ko_path=KO_FILE,
-        correct_path=CORRECT_FILE,
-        enc_name=ENCODER_NAME,
-        dec_tok=dec_tok,
-        enc_max_length=ENC_MAX_LENGTH,
-        dec_max_length=DEC_MAX_LENGTH,
-        stride=STRIDE,
-        limit=LIMIT,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-    )
+    loader = build_loader(dec_tok, BATCH_SIZE, NUM_WORKERS)
+    model = build_model(dec_tok, device)
 
-    # 배치 하나만 테스트
-    for batch in loader:
-        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-        run_sanity_checks(model, batch)
-        break
+    # 옵티마이저/스케줄러
+    optimizer = build_optimizer(model, LR, WEIGHT_DECAY)
+    scheduler = build_scheduler(optimizer, TOTAL_TRAIN_STEPS, NUM_WARMUP_STEPS, use_cosine=USE_COSINE)
+
+    # 미니 학습 실행
+    train_one_epoch(
+        model=model,
+        loader=loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        smoothing=LABEL_SMOOTHING,
+        grad_clip_norm=GRAD_CLIP_NORM,
+        accum_steps=ACCUM_STEPS,
+        sanity_batches=SANITY_BATCHES,
+    )
 
 
 if __name__ == "__main__":
