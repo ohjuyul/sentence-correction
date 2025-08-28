@@ -1,11 +1,363 @@
-root@986d73f0cf4d:/workspace/sentenpython3 infer.py --spm_path ../spm_out/tokenizer_32k.model --input "나는 밥이 먹고싶다" 고싶다"
-[Info] device: cuda
-/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
-  warnings.warn(
-[Info] Added missing special tokens to decoder tokenizer.
-[Info] Decoder vocab size: 32000
-[Info] PAD/BOS/EOS = 3/1/2
+# train_full.py — 2.2M 스트리밍 학습 + 디코더 우선 학습 + 점진적 언프리즈 + tqdm + epoch 3마다 저장
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-==============================
-[SRC] 나는 밥이 먹고싶다
-[GREEDY] 
+import math
+import time
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from transformers import T5TokenizerFast, get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
+from tqdm.auto import tqdm
+
+from model3 import CorrectionModel
+from data_txt_stream import GrammarCorrectionDataset  # IterableDataset
+
+
+# =============================
+# 구성
+# =============================
+ENCODER_NAME = "beomi/kcbert-base"
+DECODER_SPM_PATH = "../spm_out/tokenizer_32k.model"
+KO_FILE = "../ko.txt"
+CORRECT_FILE = "../correct.txt"
+
+# 데이터/길이/로더
+ENC_MAX_LENGTH = 300          # ← KC-BERT 최대 포지션 사용
+DEC_MAX_LENGTH = 256
+STRIDE = 0
+BATCH_SIZE = 8
+NUM_WORKERS = 2
+PIN_MEMORY = torch.cuda.is_available()
+LIMIT_PER_EPOCH = None        # None이면 전체 2.2M 전량
+DOWNSAMPLE_PROB = 1.0
+
+# 학습
+EPOCHS = 6                    # 예: 6 에폭 (요청: 3에폭마다 저장)
+ACCUM_STEPS = 1
+LR_DEC = 3e-4
+LR_ENC = 1e-5
+WEIGHT_DECAY = 0.01
+WARMUP_STEPS = 5_000
+TOTAL_TRAIN_STEPS_EST = None
+SAMPLES_EST = 2_200_000       # 총 샘플 수(정확히 넣어주면 bar/scheduler가 더 정확)
+
+LABEL_SMOOTHING = 0.1
+GRAD_CLIP_NORM = 1.0
+USE_COSINE = True
+
+# 로깅/저장
+LOG_EVERY = 50
+SAVE_EVERY = 10_000           # 스텝 주기 저장(옵션)
+CKPT_DIR = "./checkpoints"
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+# 점진적 언프리즈 정책
+UNFREEZE_START_LAYERS = 0
+UNFREEZE_STEP_LAYERS = 2
+UNFREEZE_MAX_LAYERS = 12      # KC-BERT base
+PATIENCE_STEPS = 5_000
+MIN_IMPROVE = 0.001           # best 대비 상대 개선 비율
+EMA_BETA = 0.98
+
+
+# =============================
+# 토크나이저 유틸
+# =============================
+def ensure_special_tokens(tok: T5TokenizerFast) -> T5TokenizerFast:
+    changed = False
+    if tok.pad_token is None:
+        tok.add_special_tokens({"pad_token": "<pad>"}); changed = True
+    if getattr(tok, "bos_token", None) is None:
+        tok.add_special_tokens({"bos_token": "<s>"}); changed = True
+    if tok.eos_token is None:
+        tok.add_special_tokens({"eos_token": "</s>"}); changed = True
+    if changed:
+        print("[Info] Added missing special tokens to decoder tokenizer.")
+    return tok
+
+
+def build_decoder_tokenizer(spm_path: str, legacy: bool=False) -> T5TokenizerFast:
+    if not os.path.exists(spm_path):
+        raise FileNotFoundError(f"Decoder SPM not found: {spm_path}")
+    tok = T5TokenizerFast(vocab_file=spm_path, extra_ids=0, legacy=legacy)
+    return ensure_special_tokens(tok)
+
+
+# =============================
+# 데이터로더
+# =============================
+def build_loader(dec_tok: T5TokenizerFast) -> DataLoader:
+    dataset = GrammarCorrectionDataset(
+        ko_file=KO_FILE,
+        correct_file=CORRECT_FILE,
+        tokenizer_name=ENCODER_NAME,
+        max_length=ENC_MAX_LENGTH,
+        stride=STRIDE,
+        limit=LIMIT_PER_EPOCH,
+        decoder_tokenizer=dec_tok,
+        dec_max_length=DEC_MAX_LENGTH,
+        downsample_prob=DOWNSAMPLE_PROB,
+    )
+    loader = DataLoader(
+        dataset=dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,  # IterableDataset
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+    )
+    return loader
+
+
+# =============================
+# 모델/옵티마이저/스케줄러
+# =============================
+def build_model(dec_tok: T5TokenizerFast, device: torch.device) -> CorrectionModel:
+    model = CorrectionModel(
+        encoder_name=ENCODER_NAME,
+        num_decoder_layers=6,
+        decoder_tokenizer=dec_tok,
+    )
+    model.to(device)
+    return model
+
+
+def split_params_for_groups(model: CorrectionModel):
+    enc_decay, enc_nodecay, dec_decay, dec_nodecay = [], [], [], []
+    for n, p in model.encoder.named_parameters():
+        (enc_nodecay if any(x in n for x in ["bias","LayerNorm.weight","layer_norm.weight","layernorm.weight"]) else enc_decay).append(p)
+    for n, p in model.decoder.named_parameters():
+        (dec_nodecay if any(x in n for x in ["bias","LayerNorm.weight","layer_norm.weight","layernorm.weight"]) else dec_decay).append(p)
+    for n, p in model.output_projection.named_parameters():
+        (dec_nodecay if any(x in n for x in ["bias","LayerNorm.weight","layer_norm.weight","layernorm.weight"]) else dec_decay).append(p)
+    return enc_decay, enc_nodecay, dec_decay, dec_nodecay
+
+
+def build_optimizer(model: CorrectionModel) -> torch.optim.Optimizer:
+    enc_decay, enc_nodecay, dec_decay, dec_nodecay = split_params_for_groups(model)
+    return torch.optim.AdamW(
+        [
+            {"params": enc_decay,    "weight_decay": WEIGHT_DECAY, "lr": LR_ENC},
+            {"params": enc_nodecay,  "weight_decay": 0.0,          "lr": LR_ENC},
+            {"params": dec_decay,    "weight_decay": WEIGHT_DECAY, "lr": LR_DEC},
+            {"params": dec_nodecay,  "weight_decay": 0.0,          "lr": LR_DEC},
+        ],
+        betas=(0.9, 0.98), eps=1e-8
+    )
+
+
+def est_steps_per_epoch() -> int:
+    samples = SAMPLES_EST if LIMIT_PER_EPOCH is None else LIMIT_PER_EPOCH
+    return math.ceil(samples / (BATCH_SIZE * max(1, ACCUM_STEPS)))
+
+
+def est_total_train_steps() -> int:
+    if TOTAL_TRAIN_STEPS_EST is not None:
+        return TOTAL_TRAIN_STEPS_EST
+    return est_steps_per_epoch() * EPOCHS
+
+
+def build_scheduler(optimizer, total_steps: int, warmup_steps: int, use_cosine: bool=True):
+    if use_cosine:
+        return get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+    else:
+        return get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+
+
+# =============================
+# 손실
+# =============================
+class LabelSmoothingCE(nn.Module):
+    def __init__(self, smoothing: float, ignore_index: int = -100):
+        super().__init__()
+        self.smoothing = smoothing
+        self.ignore_index = ignore_index
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        B, T, V = logits.shape
+        pad_mask = targets.eq(self.ignore_index)
+        n_valid = (~pad_mask).sum().clamp_min(1)
+
+        if self.smoothing > 0.0:
+            log_probs = torch.log_softmax(logits, dim=-1)
+            nll = -log_probs.gather(dim=-1, index=targets.masked_fill(pad_mask, 0).unsqueeze(-1)).squeeze(-1)
+            nll = nll.masked_fill(pad_mask, 0.0).sum() / n_valid
+            smooth = -log_probs.mean(dim=-1)
+            smooth = smooth.masked_fill(pad_mask, 0.0).sum() / n_valid
+            return (1 - self.smoothing) * nll + self.smoothing * smooth
+        else:
+            return nn.CrossEntropyLoss(ignore_index=self.ignore_index)(logits.view(B*T, V), targets.view(B*T))
+
+
+criterion = LabelSmoothingCE(LABEL_SMOOTHING, ignore_index=-100)
+
+
+# =============================
+# 언프리즈 컨트롤
+# =============================
+def set_encoder_trainable_layers(model: CorrectionModel, k_last_layers: int):
+    for p in model.encoder.parameters():
+        p.requires_grad = False
+    if k_last_layers <= 0:
+        return
+    layers = list(model.encoder.encoder.layer)
+    total = len(layers)
+    start = max(0, total - k_last_layers)
+    for i, layer in enumerate(layers):
+        for p in layer.parameters():
+            p.requires_grad = (i >= start)
+    for p in model.encoder.embeddings.parameters():
+        p.requires_grad = False
+    if hasattr(model.encoder, "pooler") and model.encoder.pooler is not None:
+        for p in model.encoder.pooler.parameters():
+            p.requires_grad = False
+
+
+# =============================
+# 학습 루틴
+# =============================
+@dataclass
+class TrainState:
+    global_step: int = 0
+    ema_loss: Optional[float] = None
+    best_ema: float = float("inf")
+    steps_since_improve: int = 0
+    unfrozen_layers: int = UNFREEZE_START_LAYERS
+
+
+def save_ckpt(model: CorrectionModel, state: TrainState, tag: str):
+    path = os.path.join(CKPT_DIR, f"step_{state.global_step}_{tag}.pt")
+    torch.save(model.state_dict(), path)
+    print(f"[Save] {path}")
+
+
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Info] device: {device}")
+
+    dec_tok = build_decoder_tokenizer(DECODER_SPM_PATH, legacy=False)
+    print(f"[Info] Decoder vocab size: {dec_tok.vocab_size}")
+    print(f"[Info] PAD/BOS/EOS = {dec_tok.pad_token_id}/{getattr(dec_tok,'bos_token_id',None)}/{dec_tok.eos_token_id}")
+
+    model = build_model(dec_tok, device)
+
+    # 초기: 인코더 전층 freeze
+    set_encoder_trainable_layers(model, UNFREEZE_START_LAYERS)
+
+    optimizer = build_optimizer(model)
+    total_steps = est_total_train_steps()
+    steps_per_epoch = est_steps_per_epoch()
+    print(f"[Info] steps/epoch (est): {steps_per_epoch}")
+    print(f"[Info] total_steps (est): {total_steps}")
+
+    scheduler = build_scheduler(optimizer, total_steps, WARMUP_STEPS, USE_COSINE)
+    scaler = torch.amp.GradScaler(device="cuda", enabled=torch.cuda.is_available())
+
+    state = TrainState(global_step=0, unfrozen_layers=UNFREEZE_START_LAYERS)
+
+    for epoch in range(EPOCHS):
+        loader = build_loader(dec_tok)  # IterableDataset: 에폭마다 새로
+        model.train()
+        running_loss = 0.0
+        accum_counter = 0
+
+        pbar = tqdm(total=steps_per_epoch, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=True)
+        for batch in loader:
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+                logits = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    decoder_input_ids=batch["decoder_input_ids"],
+                    decoder_attention_mask=batch["decoder_attention_mask"],
+                    labels=None,
+                )
+                loss = criterion(logits, batch["labels"]) / ACCUM_STEPS
+
+            scaler.scale(loss).backward()
+            accum_counter += 1
+
+            did_step = False
+            if accum_counter >= ACCUM_STEPS:
+                if GRAD_CLIP_NORM and GRAD_CLIP_NORM > 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                did_step = True
+
+                scheduler.step()
+                state.global_step += 1
+                accum_counter = 0
+
+                # tqdm 업데이트(optimizer step 기준)
+                pbar.update(1)
+
+                # running/ema
+                with torch.no_grad():
+                    l = loss.item() * ACCUM_STEPS
+                    running_loss += l
+                    if state.ema_loss is None:
+                        state.ema_loss = l
+                    else:
+                        state.ema_loss = EMA_BETA * state.ema_loss + (1 - EMA_BETA) * l
+
+                # bar postfix
+                lr_now = optimizer.param_groups[2]["lr"]  # 디코더 lr 그룹
+                pbar.set_postfix({
+                    "loss": f"{l:.2f}",
+                    "ema": f"{state.ema_loss:.2f}" if state.ema_loss is not None else "n/a",
+                    "lr": f"{lr_now:.2e}",
+                    "unfrz": state.unfrozen_layers
+                })
+
+                # 로그
+                if state.global_step % LOG_EVERY == 0:
+                    avg = running_loss / LOG_EVERY
+                    print(f"[ep {epoch+1}] step {state.global_step:>7} | loss(avg): {avg:.4f} | ema: {state.ema_loss:.4f} | lr(dec): {lr_now:.2e} | unfrozen_enc_layers: {state.unfrozen_layers}")
+                    running_loss = 0.0
+
+                # 스텝 주기 체크포인트
+                if state.global_step % SAVE_EVERY == 0:
+                    save_ckpt(model, state, "autosave")
+
+                # 언프리즈 로직
+                improved = (state.ema_loss + MIN_IMPROVE * state.best_ema) < state.best_ema
+                if improved:
+                    state.best_ema = state.ema_loss
+                    state.steps_since_improve = 0
+                else:
+                    state.steps_since_improve += 1
+
+                if state.steps_since_improve >= PATIENCE_STEPS and state.unfrozen_layers < UNFREEZE_MAX_LAYERS:
+                    new_layers = min(UNFREEZE_MAX_LAYERS, state.unfrozen_layers + UNFREEZE_STEP_LAYERS)
+                    print(f"[Unfreeze] plateau → encoder last {UNFREEZE_STEP_LAYERS} layers: {state.unfrozen_layers} → {new_layers}")
+                    state.unfrozen_layers = new_layers
+                    set_encoder_trainable_layers(model, state.unfrozen_layers)
+                    state.steps_since_improve = 0
+
+                # epoch 예상 스텝 채웠으면 다음 epoch로
+                if state.global_step % steps_per_epoch == 0:
+                    break
+
+        pbar.close()
+
+        # 에폭 끝마다 저장
+        save_ckpt(model, state, f"epoch{epoch+1}")
+        # 3 에폭마다 추가 태그 저장
+        if (epoch + 1) % 3 == 0:
+            save_ckpt(model, state, f"epoch{epoch+1}_milestone")
+
+    # 최종 저장
+    save_ckpt(model, state, "final")
+    print("[Done]")
+
+
+if __name__ == "__main__":
+    train()
