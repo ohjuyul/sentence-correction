@@ -1,11 +1,114 @@
-root@986d73f0cf4d:/workspace/sentence/src# python3 check_more.py
-You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
-/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
-  warnings.warn(
-Traceback (most recent call last):
-  File "/workspace/sentence/src/check_more.py", line 34, in <module>
-    batch = [dataset[i] for i in range(4)]
-             ~~~~~~~^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataset.py", line 59, in __getitem__
-    raise NotImplementedError("Subclasses of Dataset should implement __getitem__.")
-NotImplementedError: Subclasses of Dataset should implement __getitem__.
+# check_more_stream.py  — IterableDataset 전용 상세 점검
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import torch
+from torch.utils.data import DataLoader
+from transformers import T5TokenizerFast
+
+from model3 import CorrectionModel
+from data_txt import GrammarCorrectionDataset  # Streaming / IterableDataset
+
+# ========= 설정 =========
+ENCODER_NAME = "beomi/kcbert-base"
+DECODER_SPM_PATH = "../spm_out/tokenizer_32k.model"
+KO_FILE = "../ko.txt"
+CORRECT_FILE = "../correct.txt"
+
+ENC_MAX_LENGTH = 192
+DEC_MAX_LENGTH = 256
+STRIDE = 0
+LIMIT = 32          # 점검용으로 소량만
+BATCH_SIZE = 8
+NUM_WORKERS = 0
+
+# ========= 토크나이저 =========
+def ensure_special_tokens(tok: T5TokenizerFast) -> T5TokenizerFast:
+    changed = False
+    if tok.pad_token is None:
+        tok.add_special_tokens({"pad_token": "<pad>"}); changed = True
+    if getattr(tok, "bos_token", None) is None:
+        tok.add_special_tokens({"bos_token": "<s>"}); changed = True
+    if tok.eos_token is None:
+        tok.add_special_tokens({"eos_token": "</s>"}); changed = True
+    if changed:
+        print("[Info] Added missing special tokens to decoder tokenizer.")
+    return tok
+
+if not os.path.exists(DECODER_SPP := DECODER_SPM_PATH):
+    raise FileNotFoundError(f"SPM not found: {DECODER_SPP}")
+dec_tok = T5TokenizerFast(vocab_file=DECODER_SPP, extra_ids=0, legacy=False)
+dec_tok = ensure_special_tokens(dec_tok)
+
+# ========= 모델 =========
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = CorrectionModel(
+    encoder_name=ENCODER_NAME,
+    num_decoder_layers=6,
+    decoder_tokenizer=dec_tok,
+).to(device).eval()
+
+# ========= 데이터로더 (IterableDataset → shuffle=False) =========
+dataset = GrammarCorrectionDataset(
+    ko_file=KO_FILE,
+    correct_file=CORRECT_FILE,
+    tokenizer_name=ENCODER_NAME,
+    max_length=ENC_MAX_LENGTH,
+    stride=STRIDE,
+    limit=LIMIT,                 # 에폭당 32개만 읽음 (점검용)
+    decoder_tokenizer=dec_tok,
+    dec_max_length=DEC_MAX_LENGTH,
+    downsample_prob=1.0,
+)
+loader = DataLoader(
+    dataset=dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=torch.cuda.is_available(),
+)
+
+print(f"[Info] Decoder vocab size: {dec_tok.vocab_size}")
+print(f"[Info] PAD/BOS/EOS = {dec_tok.pad_token_id}/{getattr(dec_tok,'bos_token_id',None)}/{dec_tok.eos_token_id}")
+
+# ========= 배치 하나만 점검 =========
+batch = next(iter(loader))
+batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+# 1) forward & teacher-forcing argmax
+with torch.no_grad():
+    logits = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        decoder_input_ids=batch["decoder_input_ids"],
+        decoder_attention_mask=batch["decoder_attention_mask"],
+    )
+pred_ids = logits.argmax(-1)  # (B, T)
+
+# 2) EOS 포함 여부
+labels = batch["labels"]
+has_eos = (labels == dec_tok.eos_token_id).any().item()
+
+# 3) 배치/길이 정보
+B = batch["input_ids"].size(0)
+T = batch["decoder_input_ids"].size(1)
+print(f"[Info] batch size: {B}")
+print(f"[Info] decoder seq length: {T}")
+print(f"[Info] EOS token in labels? {bool(has_eos)}")
+
+# ---- 디코딩(눈검사용) ----
+def decode_gold(label_row):
+    # -100 제거 후 디코딩
+    ids = [int(x) for x in label_row.tolist() if x != -100]
+    return dec_tok.decode(ids, skip_special_tokens=True)
+
+def decode_pred(pred_row):
+    return dec_tok.decode(pred_row.tolist(), skip_special_tokens=True)
+
+n_show = min(4, B)
+for i in range(n_show):
+    gold = decode_gold(labels[i])
+    pred = decode_pred(pred_ids[i])
+    print(f"\n### Sample {i}")
+    print(f"[GOLD] {gold}")
+    print(f"[PRED] {pred}")
