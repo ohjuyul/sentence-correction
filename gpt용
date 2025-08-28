@@ -1,62 +1,11 @@
-# check_more.py (추가 확인 코드)
-import torch
-from transformers import T5TokenizerFast
-from model3 import CorrectionModel
-from data_txt import GrammarCorrectionDataset
-
-# --- 설정 ---
-ENCODER_NAME = "beomi/kcbert-base"
-DECODER_SPM_PATH = "../spm_out/tokenizer_32k.model"
-KO_FILE = "../ko.txt"
-CORRECT_FILE = "../correct.txt"
-
-# --- 디코더 토크나이저 ---
-dec_tok = T5TokenizerFast(vocab_file=DECODER_SPM_PATH, extra_ids=0)
-if dec_tok.pad_token is None: dec_tok.add_special_tokens({"pad_token": "<pad>"})
-if dec_tok.eos_token is None: dec_tok.add_special_tokens({"eos_token": "</s>"})
-if getattr(dec_tok, "bos_token", None) is None: dec_tok.add_special_tokens({"bos_token": "<s>"})
-
-# --- 모델 ---
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = CorrectionModel(encoder_name=ENCODER_NAME, decoder_tokenizer=dec_tok).to(device)
-model.eval()
-
-# --- 데이터셋에서 배치 하나 샘플링 ---
-dataset = GrammarCorrectionDataset(
-    ko_file=KO_FILE,
-    correct_file=CORRECT_FILE,
-    tokenizer_name=ENCODER_NAME,
-    max_length=128,
-    decoder_tokenizer=dec_tok,
-    dec_max_length=128,
-    limit=16,   # 테스트용 16개만
-)
-batch = [dataset[i] for i in range(4)]
-batch = {k: torch.stack([b[k] for b in batch]).to(device) for k in batch[0]}
-
-# --- 1) Forward & teacher-forcing argmax ---
-with torch.no_grad():
-    logits = model(
-        input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
-        decoder_input_ids=batch["decoder_input_ids"],
-        decoder_attention_mask=batch["decoder_attention_mask"],
-    )
-pred_ids = logits.argmax(-1)
-
-# --- 2) EOS 토큰 포함 여부 ---
-labels = batch["labels"]
-has_eos = (labels == dec_tok.eos_token_id).any().item()
-
-# --- 3) 길이/배치 체크 ---
-print(f"[Info] batch size: {batch['input_ids'].size(0)}")
-print(f"[Info] decoder seq length: {batch['decoder_input_ids'].size(1)}")
-print(f"[Info] EOS token in labels? {has_eos}")
-
-# --- 디코딩 결과 눈검사 ---
-for i in range(batch["input_ids"].size(0)):
-    gold = dec_tok.decode([x for x in labels[i].tolist() if x != -100])
-    pred = dec_tok.decode(pred_ids[i].tolist())
-    print(f"\n### Sample {i}")
-    print(f"[GOLD] {gold}")
-    print(f"[PRED] {pred}")
+root@986d73f0cf4d:/workspace/sentence/src# python3 check_more.py
+You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
+/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
+  warnings.warn(
+Traceback (most recent call last):
+  File "/workspace/sentence/src/check_more.py", line 34, in <module>
+    batch = [dataset[i] for i in range(4)]
+             ~~~~~~~^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataset.py", line 59, in __getitem__
+    raise NotImplementedError("Subclasses of Dataset should implement __getitem__.")
+NotImplementedError: Subclasses of Dataset should implement __getitem__.
