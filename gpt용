@@ -1,21 +1,179 @@
-root@986d73f0cf4d:/workspace/sentence/src# python3 check.py
-[Info] Using device: cuda
-You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=False`. This should only be set if you understand what it means, and thoroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565
-/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
-  warnings.warn(
-[Info] Added missing special tokens to decoder tokenizer.
-[Info] Decoder vocab size: 32000
-[Info] PAD/BOS/EOS = 3/1/2
-[Warn] Streaming에서 stride>0은 예시 수 폭증을 유발합니다. 0을 권장합니다.
-Traceback (most recent call last):
-  File "/workspace/sentence/src/check.py", line 217, in <module>
-    main()
-  File "/workspace/sentence/src/check.py", line 196, in main
+# check.py  (Streaming Dataset에 맞춘 버전)
+import os
+from typing import Dict
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import torch
+from torch.utils.data import DataLoader
+from transformers import T5TokenizerFast
+
+from model3 import CorrectionModel
+from data_txt import GrammarCorrectionDataset  # ← 지금의 Streaming/IterableDataset
+
+
+# ------------------------------
+# 구성 파라미터
+# ------------------------------
+ENCODER_NAME = "beomi/kcbert-base"
+DECODER_SPM_PATH = "../spm_out/tokenizer_32k.model"
+KO_FILE = "../ko.txt"
+CORRECT_FILE = "../correct.txt"
+
+# 스트리밍에서는 STRIDE=0 권장, LIMIT로 에폭 크기 통제
+ENC_MAX_LENGTH = 192
+DEC_MAX_LENGTH = 256
+STRIDE = 0
+LIMIT = 2048          # 배치 256 * 8스텝 정도의 소량만 확인
+BATCH_SIZE = 8
+
+# 초기엔 안전하게 num_workers=0 → 안정화 후 2~4로 올리기
+NUM_WORKERS = 0
+PREFETCH_FACTOR = 2   # num_workers>0일 때만 의미
+PERSISTENT_WORKERS = False
+
+
+# ------------------------------
+# 유틸
+# ------------------------------
+def ensure_special_tokens(tok: T5TokenizerFast) -> T5TokenizerFast:
+    changed = False
+    if tok.pad_token is None:
+        tok.add_special_tokens({"pad_token": "<pad>"}); changed = True
+    if getattr(tok, "bos_token", None) is None:
+        tok.add_special_tokens({"bos_token": "<s>"}); changed = True
+    if tok.eos_token is None:
+        tok.add_special_tokens({"eos_token": "</s>"}); changed = True
+    if changed:
+        print("[Info] Added missing special tokens to decoder tokenizer.")
+    return tok
+
+
+def build_tokenizer(spm_path: str) -> T5TokenizerFast:
+    if not os.path.exists(spm_path):
+        raise FileNotFoundError(f"Decoder SPM not found: {spm_path}")
+    tok = T5TokenizerFast(vocab_file=spm_path, extra_ids=0, legacy=False)
+    return ensure_special_tokens(tok)
+
+
+def build_model(encoder_name: str, dec_tok: T5TokenizerFast, device: torch.device) -> CorrectionModel:
+    model = CorrectionModel(
+        encoder_name=encoder_name,
+        num_decoder_layers=6,
+        decoder_tokenizer=dec_tok,
+    )
+    model.to(device)
+    model.eval()
+    return model
+
+
+def build_dataset_loader(
+    ko_path: str,
+    correct_path: str,
+    enc_name: str,
+    dec_tok: T5TokenizerFast,
+    enc_max_length: int,
+    dec_max_length: int,
+    stride: int,
+    limit: int,
+    batch_size: int,
+    num_workers: int,
+) -> DataLoader:
+    dataset = GrammarCorrectionDataset(
+        ko_file=ko_path,
+        correct_file=correct_path,
+        tokenizer_name=enc_name,
+        max_length=enc_max_length,
+        stride=stride,                 # ← 0 권장
+        limit=limit,                   # ← 에폭당 샘플 수
+        decoder_tokenizer=dec_tok,
+        dec_max_length=dec_max_length,
+        downsample_prob=1.0,
+    )
+    kwargs = dict(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=False,                 # ★ IterableDataset는 shuffle 금지
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    if num_workers > 0:
+        kwargs.update(prefetch_factor=PREFETCH_FACTOR, persistent_workers=PERSISTENT_WORKERS)
+    return DataLoader(**kwargs)
+
+
+def run_sanity_checks(model: CorrectionModel, batch: Dict[str, torch.Tensor]) -> None:
+    dec_tok = model.dec_tok
+
+    # 1) 토큰 ID 정합성 (디코더 기준)
+    assert model.config.pad_token_id == dec_tok.pad_token_id, "pad_token_id mismatch"
+    assert model.config.eos_token_id == dec_tok.eos_token_id, "eos_token_id mismatch"
+    assert model.config.decoder_start_token_id == getattr(dec_tok, "bos_token_id", None), "decoder_start_token_id != bos_token_id"
+
+    # 2) 배치 키 검사
+    required_keys = ["input_ids", "attention_mask", "labels", "decoder_input_ids", "decoder_attention_mask"]
+    for k in required_keys:
+        if k not in batch:
+            raise KeyError(f"Missing key in batch: {k}")
+
+    # 3) 라벨 범위 검사(패딩 -100 제외)
+    labels = batch["labels"]
+    labels_max = labels.masked_fill(labels.eq(-100), 0).max().item()
+    assert labels_max < dec_tok.vocab_size, "labels contain id >= decoder vocab_size"
+
+    # 4) 디코더 입력의 첫 토큰은 BOS
+    bos_id = dec_tok.bos_token_id
+    assert bos_id is not None, "decoder tokenizer must have bos_token_id"
+    assert batch["decoder_input_ids"][:, 0].eq(bos_id).all(), "decoder_input_ids do not start with BOS"
+
+    # 5) 디코더 마스크 0/1
+    unique_vals = set(batch["decoder_attention_mask"].unique().tolist())
+    assert unique_vals <= {0, 1}, f"decoder_attention_mask has invalid values: {unique_vals}"
+
+    # 6) 1회 forward 및 출력 차원 검사
+    with torch.no_grad():
+        logits = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            decoder_input_ids=batch["decoder_input_ids"],
+            decoder_attention_mask=batch["decoder_attention_mask"],
+        )
+    assert logits.shape[:2] == batch["decoder_input_ids"].shape, "logits length != decoder_input length"
+    assert logits.size(-1) == dec_tok.vocab_size, "logits vocab dim != decoder vocab_size"
+
+    print(f"[OK] BOS id: {bos_id}")
+    print(f"[OK] First tokens of decoder_input_ids: {batch['decoder_input_ids'][:, 0].tolist()}")
+    print("[OK] Model & decoder tokenizer are in sync. Single forward pass succeeded.")
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Info] Using device: {device}")
+
+    dec_tok = build_tokenizer(DECODER_SPM_PATH)
+    print(f"[Info] Decoder vocab size: {dec_tok.vocab_size}")
+    print(f"[Info] PAD/BOS/EOS = {dec_tok.pad_token_id}/{getattr(dec_tok, 'bos_token_id', None)}/{dec_tok.eos_token_id}")
+
+    model = build_model(ENCODER_NAME, dec_tok, device)
     loader = build_dataset_loader(
-             ^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/sentence/src/check.py", line 129, in build_dataset_loader
-    return DataLoader(**loader_kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataloader.py", line 339, in __init__
-    raise ValueError(
-ValueError: DataLoader with IterableDataset: expected unspecified shuffle option, but got shuffle=True
+        ko_path=KO_FILE,
+        correct_path=CORRECT_FILE,
+        enc_name=ENCODER_NAME,
+        dec_tok=dec_tok,
+        enc_max_length=ENC_MAX_LENGTH,
+        dec_max_length=DEC_MAX_LENGTH,
+        stride=STRIDE,
+        limit=LIMIT,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+    )
+
+    # 배치 하나만 테스트
+    for batch in loader:
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        run_sanity_checks(model, batch)
+        break
+
+
+if __name__ == "__main__":
+    main()
