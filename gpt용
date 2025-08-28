@@ -2,8 +2,24 @@ root@986d73f0cf4d:/workspace/sentence/src# python3 check_more.py
 /usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
   warnings.warn(
 [Info] Added missing special tokens to decoder tokenizer.
-Traceback (most recent call last):
-  File "/workspace/sentence/src/check_more.py", line 52, in <module>
-    dataset = GrammarCorrectionDataset(
-              ^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: GrammarCorrectionDataset.__init__() got an unexpected keyword argument 'downsample_prob'
+[Info] Decoder vocab size: 32000
+[Info] PAD/BOS/EOS = 3/1/2
+[Info] batch size: 8
+[Info] decoder seq length: 256
+[Info] EOS token in labels? True
+
+### Sample 0
+[GOLD] 아직도 올드팬들이 많아 랜선 관중들도 대부분 올드팬이야.
+[PRED] 아직도 올드팬들이 많아 랜선 관중들도 대부분 올드팬이야.
+
+### Sample 1
+[GOLD] 타흐리르 광장의 이집트 박물관에 있던 고대 이집트 왕국의 파라오와 왕비, 총 22명의 미라를, 새로 건립된 문명박물관으로 옮긴 행사였다.
+[PRED] 타흐리르 광장의 이집트 박물관에 있던 고대 이집트 왕국의 파라오와 왕비, 총 22명의 미라를, 새로 건립된 문명박물관으로 옮긴 행사였다.
+
+### Sample 2
+[GOLD] 아쉽게도 난 왓챠를 사용해 본 적은 아직 없네.
+[PRED] 아쉽게도 난 왓챠를 사용해 본 적은 아직 없네.
+
+### Sample 3
+[GOLD] 5세대 이동 통신 함께 작동하는 일군의 집적 회로 칩은 퀄컴이 주도하는 가운데, 삼성전자와 화웨이가 뒤를 쫓으며, 3파전을 진행하는 양상이다.
+[PRED] 5세대 이동 통신 함께 작동하는 일군의 집적 회로 칩은 퀄컴이 주도하는 가운데, 삼성전자와 화웨이가 뒤를 쫓으며, 3파전을 진행하는 양상이다.
