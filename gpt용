@@ -6,8 +6,6 @@ import torch
 from torch.utils.data import Dataset
 from transformers import BertTokenizer, PreTrainedTokenizerBase
 
-IGNORE_INDEX = -100
-
 
 # ------------------------------
 # 유틸 함수
@@ -15,10 +13,10 @@ IGNORE_INDEX = -100
 def ensure_special_tokens(tok: PreTrainedTokenizerBase) -> PreTrainedTokenizerBase:
     """
     디코더 토크나이저의 PAD/BOS/EOS 토큰을 보장합니다.
-    모델 쪽 임베딩 리사이즈는 모델 초기화 시 처리(데이터셋은 토크나이저만 보증).
     """
     if tok.pad_token is None:
         tok.add_special_tokens({"pad_token": "<pad>"})
+    # 일부 토크나이저는 bos_token 속성이 없을 수 있음
     if getattr(tok, "bos_token", None) is None:
         tok.add_special_tokens({"bos_token": "<s>"})
     if tok.eos_token is None:
@@ -28,12 +26,14 @@ def ensure_special_tokens(tok: PreTrainedTokenizerBase) -> PreTrainedTokenizerBa
 
 def shift_right(labels: torch.LongTensor, bos_id: int) -> torch.LongTensor:
     """
-    (B, L) 라벨을 기준으로 디코더 입력을 생성합니다.
-    decoder_input_ids = [BOS] + labels_without_ignore[:, :-1]
-    - labels 내 IGNORE_INDEX(-100)는 디코더 입력 생성 시 0으로 치환(토큰 의미 없음)
+    라벨을 기준으로 디코더 입력을 생성합니다.
+    decoder_input_ids = [BOS] + labels[:-1]
+    (주의) labels 내 -100 은 단지 loss mask 용도로만 쓰이며, 실제 토큰 시퀀스는 원본 ids로 구성되어야 합니다.
     """
     assert labels.dim() == 2, "labels must be (B, L)"
-    base = labels.masked_fill(labels.eq(IGNORE_INDEX), 0)
+    # -100 은 임시로 0으로 치환해도 디코더 입력 토큰 id 범위 체크에 영향이 없도록 처리
+    base = labels.clone()
+    base = base.masked_fill(base.eq(-100), 0)
     bos_col = torch.full((base.size(0), 1), bos_id, dtype=base.dtype, device=base.device)
     return torch.cat([bos_col, base[:, :-1]], dim=1)
 
@@ -43,22 +43,10 @@ def shift_right(labels: torch.LongTensor, bos_id: int) -> torch.LongTensor:
 # ------------------------------
 class GrammarCorrectionDataset(Dataset):
     """
-    한국어 문맥교정용 Dataset
     - 인코더: KC-BERT 토크나이저(입력 원문)
-    - 디코더: 사용자 SPM(T5Tokenizer/Fast 등) 토크나이저(정답 문장)
+    - 디코더: 사용자 SPM(T5TokenizerFast 등) 토크나이저(정답 문장)
     - 출력 키:
         input_ids, attention_mask, labels, decoder_input_ids, decoder_attention_mask
-    사용 예:
-        dataset = GrammarCorrectionDataset(
-            ko_file="ko.txt",
-            correct_file="correct.txt",
-            tokenizer_name="beomi/kcbert-base",
-            max_length=300,
-            stride=64,
-            limit=None,
-            decoder_tokenizer=dec_tok,
-            dec_max_length=512,
-        )
     """
     def __init__(
         self,
@@ -69,7 +57,7 @@ class GrammarCorrectionDataset(Dataset):
         stride: int = 64,
         limit: Optional[int] = None,
         decoder_tokenizer: Optional[PreTrainedTokenizerBase] = None,
-        dec_max_length: int = 512,
+        dec_max_length: int = 300,
     ):
         super().__init__()
         # 인코더(소스) 토크나이저
@@ -84,32 +72,22 @@ class GrammarCorrectionDataset(Dataset):
             raise ValueError("decoder_tokenizer를 반드시 전달해야 합니다.")
         self.dec_tok: PreTrainedTokenizerBase = ensure_special_tokens(decoder_tokenizer)
 
-        # 필수 특수 토큰 ID 확인
-        if getattr(self.dec_tok, "bos_token_id", None) is None:
-            raise ValueError("디코더 토크나이저에 bos_token_id가 필요합니다.")
-        if self.dec_tok.pad_token_id is None or self.dec_tok.eos_token_id is None:
-            raise ValueError("디코더 토크나이저의 pad/eos 토큰이 필요합니다.")
-
         self.examples: List[Dict[str, torch.Tensor]] = []
 
-        # 파일 존재 확인 및 로드
-        if not (os.path.exists(ko_file) and os.path.exists(correct_file)):
-            raise FileNotFoundError(f"ko_file or correct_file not found: {ko_file}, {correct_file}")
-
+        # 파일 읽기
         with open(ko_file, "r", encoding="utf-8") as f_ko, open(correct_file, "r", encoding="utf-8") as f_correct:
             originals = f_ko.readlines()
             corrected = f_correct.readlines()
 
-        if len(originals) != len(corrected):
-            raise AssertionError(f"원본/정답 라인 수 불일치: {len(originals)} vs {len(corrected)}")
+        assert len(originals) == len(corrected), "원본과 정답 파일의 문장 수가 다릅니다."
 
         # 문장 단위로 순회
         for idx, (src, tgt) in enumerate(zip(originals, corrected)):
             if self.limit is not None and idx >= self.limit:
                 break
 
-            src = (src or "").strip()
-            tgt = (tgt or "").strip()
+            src = src.strip()
+            tgt = tgt.strip()
             if not src or not tgt:
                 continue
 
@@ -118,20 +96,20 @@ class GrammarCorrectionDataset(Dataset):
 
             # 2) 타깃: 디코더 토큰화(문장 단위), labels/decoder_input_ids/decoder_attention_mask 생성
             tgt_pack = self._tokenize_target(tgt)
-            labels: torch.Tensor = tgt_pack["labels"]                       # (L,)
-            decoder_input_ids: torch.Tensor = tgt_pack["decoder_input_ids"] # (L,)
-            decoder_attention_mask: torch.Tensor = tgt_pack["decoder_attention_mask"]  # (L,)
+            labels: torch.Tensor = tgt_pack["labels"]
+            decoder_input_ids: torch.Tensor = tgt_pack["decoder_input_ids"]
+            decoder_attention_mask: torch.Tensor = tgt_pack["decoder_attention_mask"]
 
-            # 3) 슬라이싱된 소스 chunk 각각에 동일 타깃을 매핑 (정렬 안정)
+            # 3) 슬라이싱된 소스 chunk 각각에 동일 타깃을 매핑 (가장 안전한 정렬 방식)
             n = src_chunks["input_ids"].size(0)
             for i in range(n):
                 self.examples.append(
                     {
-                        "input_ids": src_chunks["input_ids"][i].clone(),                 # (L,)
-                        "attention_mask": src_chunks["attention_mask"][i].clone(),       # (L,)
-                        "labels": labels.clone(),                                        # (L,)
-                        "decoder_input_ids": decoder_input_ids.clone(),                  # (L,)
-                        "decoder_attention_mask": decoder_attention_mask.clone(),        # (L,)
+                        "input_ids": src_chunks["input_ids"][i],                 # (L,)
+                        "attention_mask": src_chunks["attention_mask"][i],       # (L,)
+                        "labels": labels,                                        # (L,)
+                        "decoder_input_ids": decoder_input_ids,                  # (L,)
+                        "decoder_attention_mask": decoder_attention_mask,        # (L,)
                     }
                 )
 
@@ -141,7 +119,7 @@ class GrammarCorrectionDataset(Dataset):
     def _tokenize_source(self, text: str) -> Dict[str, torch.Tensor]:
         """
         인코더 입력(소스)을 슬라이딩 윈도우로 토크나이즈합니다.
-        padding='max_length' 고정(훈련/추론 정책에 맞춰 필요 시 조정).
+        padding='max_length' 로 고정(모델/훈련 파이프라인 정책에 맞춰 필요시 조정)
         """
         return self.src_tok(
             text,
@@ -157,7 +135,7 @@ class GrammarCorrectionDataset(Dataset):
         """
         디코더 입력/라벨을 생성합니다.
         - labels: tgt ids (PAD → -100)
-        - decoder_input_ids: shift-right(labels 기반, BOS 선행)
+        - decoder_input_ids: shift-right(labels)
         - decoder_attention_mask: (decoder_input_ids != pad_id)
         """
         enc = self.dec_tok(
@@ -170,16 +148,18 @@ class GrammarCorrectionDataset(Dataset):
         # (1, L) → (L,)
         tgt_ids: torch.Tensor = enc["input_ids"][0]
         pad_id = self.dec_tok.pad_token_id
-        bos_id = self.dec_tok.bos_token_id
+        bos_id = getattr(self.dec_tok, "bos_token_id", None)
+        if bos_id is None:
+            raise ValueError("디코더 토크나이저에 bos_token_id가 필요합니다.")
 
-        # labels: pad → -100 (loss에서 무시)
+        # labels: pad → -100
         labels = tgt_ids.clone()
-        labels[labels == pad_id] = IGNORE_INDEX
+        labels[labels == pad_id] = -100
 
-        # decoder_input_ids: shift-right
+        # decoder_input_ids: shift-right(labels 기반)
         dec_inp = shift_right(labels.unsqueeze(0), bos_id=bos_id)[0]
 
-        # decoder_attention_mask: 디코더 입력에서 pad가 아닌 곳
+        # decoder_attention_mask
         dec_attn = (dec_inp != pad_id).long()
 
         return {
@@ -198,16 +178,17 @@ class GrammarCorrectionDataset(Dataset):
         return self.examples[idx]
 
     # ------------------------------
-    # 편의: 배치 제너레이터(선택)
+    # 편의: 배치 제너레이터
     # ------------------------------
     def get_batches(self, batch_size: int = 8, device: Optional[str] = None) -> Iterator[Dict[str, torch.Tensor]]:
         """
-        간단한 배치 제너레이터 (DataLoader 없이 빠른 확인용)
+        간단한 배치 제너레이터 (학습 루프에서 DataLoader 대신 빠르게 확인할 때 사용)
         """
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
         for i in range(0, len(self.examples), batch_size):
-            batch = self.examples[i: i + batch_size]
+            batch = self.examples[i : i + batch_size]
+            # key별 스택 후 디바이스 이동
             batch_tensors = {k: torch.stack([item[k] for item in batch]).to(device) for k in batch[0]}
             yield batch_tensors
