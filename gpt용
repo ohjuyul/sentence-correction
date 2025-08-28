@@ -1,30 +1,62 @@
-root@986d73f0cf4d:/workspace/sentence/src# python3 train_sanity.py
-[Info] Using device: cuda
-/usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
-  warnings.warn(
-[Info] Added missing special tokens to decoder tokenizer.
-[Info] Decoder vocab size: 32000
-[Info] PAD/BOS/EOS = 3/1/2
-/usr/local/lib/python3.12/dist-packages/torch/optim/lr_scheduler.py:182: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
-  warnings.warn(
-[step 10] loss(avg): 511.3200 | lr: 6.00e-06 | opt-steps: 10
-[step 20] loss(avg): 458.1123 | lr: 1.20e-05 | opt-steps: 20
-[step 30] loss(avg): 354.7425 | lr: 1.80e-05 | opt-steps: 30
-[step 40] loss(avg): 286.2978 | lr: 2.40e-05 | opt-steps: 40
-[step 50] loss(avg): 243.5345 | lr: 3.00e-05 | opt-steps: 50
-[step 60] loss(avg): 214.1834 | lr: 3.60e-05 | opt-steps: 60
-[step 70] loss(avg): 192.6816 | lr: 4.20e-05 | opt-steps: 70
-[step 80] loss(avg): 176.3321 | lr: 4.80e-05 | opt-steps: 80
-[step 90] loss(avg): 163.3717 | lr: 5.40e-05 | opt-steps: 90
-[step 100] loss(avg): 152.9101 | lr: 6.00e-05 | opt-steps: 100
-[step 110] loss(avg): 144.2846 | lr: 6.60e-05 | opt-steps: 110
-[step 120] loss(avg): 137.0307 | lr: 7.20e-05 | opt-steps: 120
-[step 130] loss(avg): 130.8440 | lr: 7.80e-05 | opt-steps: 130
-[step 140] loss(avg): 125.5291 | lr: 8.40e-05 | opt-steps: 140
-[step 150] loss(avg): 120.9054 | lr: 9.00e-05 | opt-steps: 150
-[step 160] loss(avg): 116.8016 | lr: 9.60e-05 | opt-steps: 160
-[step 170] loss(avg): 113.2392 | lr: 1.02e-04 | opt-steps: 170
-[step 180] loss(avg): 110.0847 | lr: 1.08e-04 | opt-steps: 180
-[step 190] loss(avg): 107.2046 | lr: 1.14e-04 | opt-steps: 190
-[step 200] loss(avg): 104.5476 | lr: 1.20e-04 | opt-steps: 200
-[SANITY DONE] steps: 200, optimizer-steps: 200, loss(avg): 104.5476
+# check_more.py (추가 확인 코드)
+import torch
+from transformers import T5TokenizerFast
+from model3 import CorrectionModel
+from data_txt import GrammarCorrectionDataset
+
+# --- 설정 ---
+ENCODER_NAME = "beomi/kcbert-base"
+DECODER_SPM_PATH = "../spm_out/tokenizer_32k.model"
+KO_FILE = "../ko.txt"
+CORRECT_FILE = "../correct.txt"
+
+# --- 디코더 토크나이저 ---
+dec_tok = T5TokenizerFast(vocab_file=DECODER_SPM_PATH, extra_ids=0)
+if dec_tok.pad_token is None: dec_tok.add_special_tokens({"pad_token": "<pad>"})
+if dec_tok.eos_token is None: dec_tok.add_special_tokens({"eos_token": "</s>"})
+if getattr(dec_tok, "bos_token", None) is None: dec_tok.add_special_tokens({"bos_token": "<s>"})
+
+# --- 모델 ---
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = CorrectionModel(encoder_name=ENCODER_NAME, decoder_tokenizer=dec_tok).to(device)
+model.eval()
+
+# --- 데이터셋에서 배치 하나 샘플링 ---
+dataset = GrammarCorrectionDataset(
+    ko_file=KO_FILE,
+    correct_file=CORRECT_FILE,
+    tokenizer_name=ENCODER_NAME,
+    max_length=128,
+    decoder_tokenizer=dec_tok,
+    dec_max_length=128,
+    limit=16,   # 테스트용 16개만
+)
+batch = [dataset[i] for i in range(4)]
+batch = {k: torch.stack([b[k] for b in batch]).to(device) for k in batch[0]}
+
+# --- 1) Forward & teacher-forcing argmax ---
+with torch.no_grad():
+    logits = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        decoder_input_ids=batch["decoder_input_ids"],
+        decoder_attention_mask=batch["decoder_attention_mask"],
+    )
+pred_ids = logits.argmax(-1)
+
+# --- 2) EOS 토큰 포함 여부 ---
+labels = batch["labels"]
+has_eos = (labels == dec_tok.eos_token_id).any().item()
+
+# --- 3) 길이/배치 체크 ---
+print(f"[Info] batch size: {batch['input_ids'].size(0)}")
+print(f"[Info] decoder seq length: {batch['decoder_input_ids'].size(1)}")
+print(f"[Info] EOS token in labels? {has_eos}")
+
+# --- 디코딩 결과 눈검사 ---
+for i in range(batch["input_ids"].size(0)):
+    gold = dec_tok.decode([x for x in labels[i].tolist() if x != -100])
+    pred = dec_tok.decode(pred_ids[i].tolist())
+    print(f"\n### Sample {i}")
+    print(f"[GOLD] {gold}")
+    print(f"[PRED] {pred}")
