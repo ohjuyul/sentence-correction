@@ -1,5 +1,5 @@
 # train_full_split.py
-# 2.23M 스트리밍 + 8:1:1 분할 + tqdm + 에폭별 val(loss/acc) + EarlyStopping(patience=3)
+# 2.23M 스트리밍 + 8:1:1 분할 + tqdm + 에폭별 val(loss/acc/CER) + EarlyStopping(patience=3)
 # 디코더 우선 학습 → plateau 시 인코더 점진적 언프리즈(뒤에서부터 k층씩)
 
 import os
@@ -23,7 +23,7 @@ ENCODER_NAME    = "beomi/kcbert-base"
 DECODER_SPM     = "../spm_out/tokenizer_32k.model"
 KO_PATH         = "../ko.txt"
 COR_PATH        = "../correct.txt"
-TOTAL_LINES     = 2_228_281   # 제공해주신 정확한 개수
+TOTAL_LINES     = 2_228_281   # 제공한 정확한 총 샘플 수
 
 # ========= 데이터/로더 설정 =========
 ENC_MAX_LEN     = 300
@@ -53,7 +53,7 @@ EMA_BETA              = 0.98
 
 # ========= Early Stopping (Validation 기반) =========
 ES_MONITOR     = "val_loss"   # "val_loss" 또는 "val_acc"
-ES_MIN_DELTA   = 0.0          # 개선으로 인정할 최소 변화량(작게)
+ES_MIN_DELTA   = 0.0          # 개선으로 인정할 최소 변화량
 ES_PATIENCE_EP = 3            # 연속 N 에폭 개선 없으면 중단
 
 # ========= 저장/로그 =========
@@ -62,6 +62,10 @@ LOG_EVERY  = 100                   # step
 MILESTONE_EVERY_EPOCHS = 3         # 3에폭마다 마일스톤 저장
 SAVE_EVERY_STEPS = 20_000          # (옵션) 스텝 주기 저장
 os.makedirs(CKPT_DIR, exist_ok=True)
+
+# ========= 평가 옵션 =========
+# CER 속도 위해 캡 (0이면 전체 샘플 CER 계산)
+EVAL_CER_MAX_SAMPLES = 5_000
 
 IGNORE_INDEX = -100
 
@@ -89,8 +93,7 @@ def build_dec_tok(spm_path: str, legacy: bool=False) -> T5TokenizerFast:
 
 
 # --------------------------
-# 스트리밍 분할 데이터셋
-# (메모리 미적재, 지정된 라인 범위만 순차 처리)
+# 스트리밍 분할 데이터셋 (메모리 미적재)
 # --------------------------
 def shift_right_1d(labels_1d: torch.Tensor, bos_id: int) -> torch.Tensor:
     base = labels_1d.masked_fill(labels_1d.eq(IGNORE_INDEX), 0)
@@ -108,7 +111,7 @@ class SplitStreamDataset(IterableDataset):
         start_idx: int,   # 포함
         end_idx: int,     # 미포함
         enc_tok_name: str = ENCODER_NAME,
-        enc_max_len: int = ENC_MAX_LEN,
+        enc_max_len: int = ENCOD_MAX_LEN,
         dec_tok: Optional[PreTrainedTokenizerBase] = None,
         dec_max_len: int = DEC_MAX_LEN,
     ):
@@ -288,14 +291,51 @@ class ESState:
     best_epoch: int = -1
     wait: int = 0
 
-def is_better(curr, best):
-    return (curr < best) if ES_MONITOR=="val_loss" else (curr > best)
+def is_better_val(curr, best):
+    if ES_MONITOR == "val_loss":
+        return curr < (best - ES_MIN_DELTA)
+    else:
+        return curr > (best + ES_MIN_DELTA)
+
+
+# --------------------------
+# 평가 헬퍼 (ids→텍스트, CER)
+# --------------------------
+def ids_to_text(dec_tok, ids: torch.Tensor, pad_id: int, eos_id: int) -> str:
+    arr = ids.detach().cpu().tolist()
+    arr = [pad_id if t == IGNORE_INDEX else t for t in arr]
+    if eos_id in arr:
+        cut = arr.index(eos_id) + 1  # eos 포함 후 디코드
+        arr = arr[:cut]
+    return dec_tok.decode(arr, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+def cer_one(ref: str, hyp: str) -> float:
+    R, H = ref, hyp
+    n, m = len(R), len(H)
+    if n == 0:
+        return float(m > 0)
+    dp = [[0]*(m+1) for _ in range(n+1)]
+    for i in range(n+1):
+        dp[i][0] = i
+    for j in range(m+1):
+        dp[0][j] = j
+    for i in range(1, n+1):
+        ri = R[i-1]
+        for j in range(1, m+1):
+            hj = H[j-1]
+            dp[i][j] = min(
+                dp[i-1][j] + 1,
+                dp[i][j-1] + 1,
+                dp[i-1][j-1] + (ri != hj)
+            )
+    return dp[n][m] / max(1, n)
 
 
 # --------------------------
 # 평가 루프 (teacher-forced)
 #   - loss
 #   - token accuracy (pad 제외)
+#   - CER (문자단위, cap 적용)
 # --------------------------
 @torch.no_grad()
 def evaluate(model: CorrectionModel, loader: DataLoader, device) -> Dict[str, float]:
@@ -303,6 +343,12 @@ def evaluate(model: CorrectionModel, loader: DataLoader, device) -> Dict[str, fl
     total_loss = 0.0
     total_tok  = 0
     total_cor  = 0
+    total_cer  = 0.0
+    n_cer      = 0
+
+    dec_tok  = model.dec_tok
+    pad_id   = dec_tok.pad_token_id
+    eos_id   = dec_tok.eos_token_id
 
     for batch in tqdm(loader, desc="Validate/Test", leave=False):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -316,16 +362,28 @@ def evaluate(model: CorrectionModel, loader: DataLoader, device) -> Dict[str, fl
         loss = criterion(logits, batch["labels"]).item()
         total_loss += loss
 
-        # token-level accuracy (ignore -100)
-        preds = logits.argmax(-1)              # (B,T)
-        golds = batch["labels"]                # (B,T)
+        # token-level accuracy
+        preds = logits.argmax(-1)     # (B,T)
+        golds = batch["labels"]       # (B,T)
         mask  = golds.ne(IGNORE_INDEX)
         total_tok += mask.sum().item()
         total_cor += (preds.eq(golds) & mask).sum().item()
 
+        # CER (cap 적용)
+        if EVAL_CER_MAX_SAMPLES == 0 or n_cer < EVAL_CER_MAX_SAMPLES:
+            B = preds.size(0)
+            for b in range(B):
+                if EVAL_CER_MAX_SAMPLES and n_cer >= EVAL_CER_MAX_SAMPLES:
+                    break
+                hyp_text  = ids_to_text(dec_tok, preds[b], pad_id, eos_id)
+                gold_text = ids_to_text(dec_tok, golds[b], pad_id, eos_id)
+                total_cer += cer_one(gold_text, hyp_text)
+                n_cer     += 1
+
     avg_loss = total_loss / max(1, len(loader))
     acc = (total_cor / max(1, total_tok)) if total_tok > 0 else 0.0
-    return {"loss": avg_loss, "acc": acc}
+    avg_cer = (total_cer / max(1, n_cer)) if n_cer > 0 else 0.0
+    return {"loss": avg_loss, "acc": acc, "cer": avg_cer}
 
 
 # --------------------------
@@ -392,7 +450,6 @@ def main():
             try:
                 batch = next(train_iter)
             except StopIteration:
-                # 안전장치: 새 iterator 열기
                 train_iter = iter(build_loader_for("train"))
                 batch = next(train_iter)
 
@@ -461,7 +518,7 @@ def main():
 
         # ===== Validate =====
         val_metrics = evaluate(model, val_loader, device)
-        print(f"[val] epoch {epoch+1} | loss {val_metrics['loss']:.4f} | acc {val_metrics['acc']*100:.2f}%")
+        print(f"[val] epoch {epoch+1} | loss {val_metrics['loss']:.4f} | acc {val_metrics['acc']*100:.2f}% | cer {val_metrics['cer']:.4f}")
 
         # 에폭마다 저장 + 3에폭마다 마일스톤 저장
         save_ckpt(model, f"epoch{epoch+1}", state.global_step)
@@ -470,9 +527,7 @@ def main():
 
         # ===== Early Stopping 판단 =====
         monitor_value = val_metrics["loss"] if ES_MONITOR == "val_loss" else val_metrics["acc"]
-        # 개선 여부
-        better = is_better(monitor_value + (0 if ES_MONITOR=="val_loss" else 0), es.best_metric + (ES_MIN_DELTA if ES_MONITOR=="val_loss" else -ES_MIN_DELTA))
-        if better:
+        if is_better_val(monitor_value, es.best_metric):
             es.best_metric = monitor_value
             es.best_epoch = epoch + 1
             es.wait = 0
@@ -485,7 +540,7 @@ def main():
 
     # ===== Test (마지막) =====
     test_metrics = evaluate(model, test_loader, device)
-    print(f"[test] loss {test_metrics['loss']:.4f} | acc {test_metrics['acc']*100:.2f}%")
+    print(f"[test] loss {test_metrics['loss']:.4f} | acc {test_metrics['acc']*100:.2f}% | cer {test_metrics['cer']:.4f}")
     print("[Done]")
 
 if __name__ == "__main__":
