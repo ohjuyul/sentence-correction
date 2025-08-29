@@ -1,6 +1,7 @@
 # train_full_split.py
 # 8:1:1 분할 파일 사용 + tqdm + 에폭별 val(loss/acc/CER) + EarlyStopping
 # 언프리즈: 워밍업 이후 + 최소 스텝 + 에폭 1 이후에만 점진적(뒤에서부터 k층)
+# 10k step마다 mid-epoch validation(loss/acc/CER) 출력 추가
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -51,8 +52,8 @@ GRAD_CLIP_NORM  = 1.0
 UNFREEZE_START_LAYERS = 0
 UNFREEZE_STEP_LAYERS  = 2
 UNFREEZE_MAX_LAYERS   = 12
-PATIENCE_STEPS_TRAIN  = 20_000   # 초반 노이즈에 덜 민감 (기존 5k → 20k)
-MIN_IMPROVE_RATIO     = 0.0002   # 0.02%만 개선돼도 개선으로 인정 (기존 0.1% → 0.02%)
+PATIENCE_STEPS_TRAIN  = 20_000   # 초반 노이즈에 덜 민감
+MIN_IMPROVE_RATIO     = 0.0002   # 작은 개선도 인정
 EMA_BETA              = 0.98
 MIN_STEPS_FOR_UNFREEZE = 30_000  # 최소 3만 스텝은 디코더만
 
@@ -70,6 +71,11 @@ os.makedirs(CKPT_DIR, exist_ok=True)
 # ========= 평가 옵션 =========
 EVAL_CER_MAX_SAMPLES = 5_000
 IGNORE_INDEX = -100
+
+# ========= Mid-epoch validation(가벼운 검증) =========
+MIDVAL_EVERY_STEPS = 10_000
+MIDVAL_MAX_BATCHES = 16
+MIDVAL_MAX_SAMPLES = 2_000
 
 
 # --------------------------
@@ -249,39 +255,61 @@ def evaluate(model: CorrectionModel, loader: DataLoader, device) -> Dict[str, fl
     return {"loss": avg_loss, "acc": acc, "cer": avg_cer}
 
 @torch.no_grad()
-def evaluate_peek(dec_tok: T5TokenizerFast, device, max_batches=6, max_samples=600):
-    """가벼운 밸리데이션 CER 추정 (tqdm에 표시용). 새 로더로 앞부분만 빠르게 훑는다."""
-    ds = GrammarCorrectionDataset(
-        ko_file=KO_VAL, correct_file=COR_VAL,
-        tokenizer_name=ENCODER_NAME, max_length=ENC_MAX_LEN, stride=0,
-        limit=max_batches * BATCH_SIZE, decoder_tokenizer=dec_tok,
-        dec_max_length=DEC_MAX_LEN, downsample_prob=1.0,
-    )
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=PIN_MEMORY)
-    model = evaluate_peek.model  # set in main
+def evaluate_midepoch(model: CorrectionModel, val_loader: DataLoader, device,
+                      max_batches=MIDVAL_MAX_BATCHES, max_samples=MIDVAL_MAX_SAMPLES) -> Dict[str, float]:
+    """학습 중간에 가볍게 val에서 앞쪽 일부만 훑어 loss/acc/CER 추정."""
+    was_training = model.training
     model.eval()
 
-    total_cer, n = 0.0, 0
+    total_loss, total_tok, total_cor, total_cer, n_cer = 0.0, 0, 0, 0.0, 0
+    dec_tok = model.dec_tok
     pad_id = dec_tok.pad_token_id
-    for batch in loader:
+
+    it = iter(val_loader)
+    batches_done = 0
+    while batches_done < max_batches:
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
         logits = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             decoder_input_ids=batch["decoder_input_ids"],
             decoder_attention_mask=batch["decoder_attention_mask"],
         )
+        total_loss += criterion(logits, batch["labels"]).item()
+
         preds = logits.argmax(-1)
         golds = batch["labels"]
+        mask  = golds.ne(IGNORE_INDEX)
+        total_tok += mask.sum().item()
+        total_cor += (preds.eq(golds) & mask).sum().item()
+
         B = preds.size(0)
         for b in range(B):
-            if n >= max_samples: break
+            if max_samples and n_cer >= max_samples:
+                break
             hyp  = dec_tok.decode(preds[b].tolist(), skip_special_tokens=True)
             gold = [pad_id if t == IGNORE_INDEX else t for t in golds[b].tolist()]
             ref  = dec_tok.decode(gold, skip_special_tokens=True)
-            total_cer += cer_one(ref, hyp); n += 1
-        if n >= max_samples: break
-    return (total_cer / n) if n > 0 else None
+            total_cer += cer_one(ref, hyp)
+            n_cer += 1
+
+        batches_done += 1
+        if max_samples and n_cer >= max_samples:
+            break
+
+    denom_batches = max(1, batches_done)
+    avg_loss = total_loss / denom_batches
+    acc = total_cor / max(1, total_tok) if total_tok > 0 else 0.0
+    avg_cer = total_cer / max(1, n_cer) if n_cer > 0 else 0.0
+
+    if was_training:
+        model.train()
+    return {"loss": avg_loss, "acc": acc, "cer": avg_cer}
 
 
 # --------------------------
@@ -327,9 +355,6 @@ def main():
     val_loader   = build_loader(KO_VAL,   COR_VAL,   limit=None)
     test_loader  = build_loader(KO_TEST,  COR_TEST,  limit=None)
 
-    # peek 함수에서 모델 접근할 수 있게 주입
-    evaluate_peek.model = model
-
     state, es = TrainState(), ESState()
 
     for epoch in range(EPOCHS):
@@ -372,17 +397,19 @@ def main():
                 running_loss += l; running_steps += 1
                 state.ema_loss = l if state.ema_loss is None else EMA_BETA*state.ema_loss + (1-EMA_BETA)*l
 
-                # 가벼운 CER 피크 (2k 스텝마다 몇 배치만)
-                if state.global_step % 2000 == 0:
-                    peek_cer = evaluate_peek(dec_tok, device, max_batches=6, max_samples=600)
+                # === 10k step마다 가벼운 mid-epoch val ===
+                if (state.global_step % MIDVAL_EVERY_STEPS) == 0:
+                    mid = evaluate_midepoch(model, val_loader, device)
+                    print(f"[mid-val] step {state.global_step} | loss {mid['loss']:.4f} | acc {mid['acc']*100:.2f}% | cer {mid['cer']:.4f}")
                 else:
-                    peek_cer = None
+                    mid = None
 
                 # tqdm
                 pf = {"loss": f"{l:.2f}", "ema": f"{state.ema_loss:.2f}",
                       "lr": f"{optimizer.param_groups[2]['lr']:.2e}", "unfrz": state.unfrozen_layers}
-                if peek_cer is not None:
-                    pf["cer(peek)"] = f"{peek_cer:.3f}"
+                if mid is not None:
+                    pf["mid_loss"] = f"{mid['loss']:.3f}"
+                    pf["mid_cer"]  = f"{mid['cer']:.3f}"
                 pbar.update(1); pbar.set_postfix(pf)
 
                 # (옵션) 주기 저장
