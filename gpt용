@@ -51,8 +51,8 @@ GRAD_CLIP_NORM  = 1.0
 UNFREEZE_START_LAYERS = 0
 UNFREEZE_STEP_LAYERS  = 2
 UNFREEZE_MAX_LAYERS   = 12
-PATIENCE_STEPS_TRAIN  = 20_000   # 초반 노이즈에 덜 민감 (기존 5k → 20k)
-MIN_IMPROVE_RATIO     = 0.0002   # 0.02%만 개선돼도 개선으로 인정 (기존 0.1% → 0.02%)
+PATIENCE_STEPS_TRAIN  = 20_000   # 5k → 20k (초반 노이즈에 덜 민감)
+MIN_IMPROVE_RATIO     = 0.0002   # 0.1% → 0.02% (작은 개선도 인정)
 EMA_BETA              = 0.98
 MIN_STEPS_FOR_UNFREEZE = 30_000  # 최소 3만 스텝은 디코더만
 
@@ -70,6 +70,11 @@ os.makedirs(CKPT_DIR, exist_ok=True)
 # ========= 평가 옵션 =========
 EVAL_CER_MAX_SAMPLES = 5_000
 IGNORE_INDEX = -100
+
+# ========= CER 피크 주기/규모 =========
+PEEK_EVERY_STEPS = 2000
+PEEK_MAX_BATCHES = 4
+PEEK_MAX_SAMPLES = 400
 
 
 # --------------------------
@@ -248,22 +253,21 @@ def evaluate(model: CorrectionModel, loader: DataLoader, device) -> Dict[str, fl
     avg_cer = total_cer / max(1, n_cer) if n_cer > 0 else 0.0
     return {"loss": avg_loss, "acc": acc, "cer": avg_cer}
 
+@torch.no_additional_grad = torch.no_grad  # (just to avoid linter warning if any)
 @torch.no_grad()
-def evaluate_peek(dec_tok: T5TokenizerFast, device, max_batches=6, max_samples=600):
-    """가벼운 밸리데이션 CER 추정 (tqdm에 표시용). 새 로더로 앞부분만 빠르게 훑는다."""
-    ds = GrammarCorrectionDataset(
-        ko_file=KO_VAL, correct_file=COR_VAL,
-        tokenizer_name=ENCODER_NAME, max_length=ENC_MAX_LEN, stride=0,
-        limit=max_batches * BATCH_SIZE, decoder_tokenizer=dec_tok,
-        dec_max_length=DEC_MAX_LEN, downsample_prob=1.0,
-    )
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=PIN_MEMORY)
-    model = evaluate_peek.model  # set in main
+def evaluate_peek(model: CorrectionModel, val_loader: DataLoader, device, max_batches=4, max_samples=400):
+    """학습 중 가벼운 CER 추정: val 로더에서 앞쪽 몇 배치만 훑음."""
     model.eval()
-
-    total_cer, n = 0.0, 0
+    dec_tok = model.dec_tok
     pad_id = dec_tok.pad_token_id
-    for batch in loader:
+    total_cer, n = 0.0, 0
+
+    it = iter(val_loader)
+    for _ in range(max_batches):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         logits = model(
             input_ids=batch["input_ids"],
@@ -281,6 +285,7 @@ def evaluate_peek(dec_tok: T5TokenizerFast, device, max_batches=6, max_samples=6
             ref  = dec_tok.decode(gold, skip_special_tokens=True)
             total_cer += cer_one(ref, hyp); n += 1
         if n >= max_samples: break
+
     return (total_cer / n) if n > 0 else None
 
 
@@ -327,9 +332,6 @@ def main():
     val_loader   = build_loader(KO_VAL,   COR_VAL,   limit=None)
     test_loader  = build_loader(KO_TEST,  COR_TEST,  limit=None)
 
-    # peek 함수에서 모델 접근할 수 있게 주입
-    evaluate_peek.model = model
-
     state, es = TrainState(), ESState()
 
     for epoch in range(EPOCHS):
@@ -372,9 +374,9 @@ def main():
                 running_loss += l; running_steps += 1
                 state.ema_loss = l if state.ema_loss is None else EMA_BETA*state.ema_loss + (1-EMA_BETA)*l
 
-                # 가벼운 CER 피크 (2k 스텝마다 몇 배치만)
-                if state.global_step % 2000 == 0:
-                    peek_cer = evaluate_peek(dec_tok, device, max_batches=6, max_samples=600)
+                # 가벼운 CER 피크 (PEEK_EVERY_STEPS마다 소량 배치만)
+                if (state.global_step % PEEK_EVERY_STEPS) == 0:
+                    peek_cer = evaluate_peek(model, val_loader, device, max_batches=PEEK_MAX_BATCHES, max_samples=PEEK_MAX_SAMPLES)
                 else:
                     peek_cer = None
 
