@@ -1,35 +1,37 @@
+# model3.py
 import math
-import warnings
-from typing import Optional, Tuple, List, Union, Callable
+from typing import Optional, Tuple, List, Union
 
 import torch
 import torch.nn as nn
 from transformers import BertModel, BertTokenizer, PretrainedConfig
 
-# --- 헬퍼 함수 및 상수 ---
 
-# 간단한 logger warning_once 구현 (없으면 print로 대체)
+# ------------------------------
+# 헬퍼/상수
+# ------------------------------
 class SimpleLogger:
     _warned = set()
+
     @classmethod
     def warning_once(cls, msg):
         if msg not in cls._warned:
             print(f"Warning: {msg}")
             cls._warned.add(msg)
+
+
 logger = SimpleLogger()
 
-# ACT2FN 맵 (BART에서 쓰는 활성화 함수 매핑)
 ACT2FN = {
     "gelu": nn.functional.gelu,
     "relu": nn.functional.relu,
     "silu": nn.functional.silu,
-    "gelu_new": nn.functional.gelu,  # gelu_new와 gelu 동일 처리 (간단히)
+    "gelu_new": nn.functional.gelu,  # 간단화
 }
 
-# Cache, EncoderDecoderCache, BaseModelOutputWithPastAndCrossAttentions 등은
-# 본격적인 캐싱/출력 객체이므로 간략하게 None 또는 튜플로 처리(실제 학습 시 개선 필요)
 Cache = object
 EncoderDecoderCache = object
+
 
 class BaseModelOutputWithPastAndCrossAttentions:
     def __init__(self, last_hidden_state, past_key_values, hidden_states=None, attentions=None, cross_attentions=None):
@@ -39,12 +41,14 @@ class BaseModelOutputWithPastAndCrossAttentions:
         self.attentions = attentions
         self.cross_attentions = cross_attentions
 
-# Dummy is_torchdynamo_compiling 함수
+
 def is_torchdynamo_compiling():
     return False
 
-# --- 임베딩 클래스 ---
 
+# ------------------------------
+# 임베딩 계층
+# ------------------------------
 class BartScaledWordEmbedding(nn.Embedding):
     def __init__(self, vocab_size, embed_dim, padding_idx, embed_scale=1.0):
         super().__init__(vocab_size, embed_dim, padding_idx=padding_idx)
@@ -53,7 +57,15 @@ class BartScaledWordEmbedding(nn.Embedding):
     def forward(self, input_ids):
         return super().forward(input_ids) * self.embed_scale
 
+
 class BartLearnedPositionalEmbedding(nn.Module):
+    """
+    - position_ids가 주어지면 그 길이에 맞춰 반환
+    - position_ids가 없으면 input_ids 길이를 사용
+    - 반환 shape:
+        * position_ids: [L]  -> [L, D]
+        * position_ids: [B,L]-> [B, L, D]
+    """
     def __init__(self, num_embeddings, embedding_dim):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim))
@@ -62,14 +74,22 @@ class BartLearnedPositionalEmbedding(nn.Module):
     def reset_parameters(self):
         nn.init.normal_(self.weight, mean=0, std=0.02)
 
-    def forward(self, input_ids, past_key_values_length=0, position_ids=None):
-        seq_len = input_ids.shape[1]
+    def forward(self, input_ids: Optional[torch.Tensor] = None, past_key_values_length: int = 0,
+                position_ids: Optional[torch.Tensor] = None):
         if position_ids is None:
-            position_ids = torch.arange(past_key_values_length, past_key_values_length + seq_len, dtype=torch.long, device=input_ids.device)
+            assert input_ids is not None, "Either input_ids or position_ids must be provided."
+            seq_len = input_ids.shape[1]
+            position_ids = torch.arange(
+                past_key_values_length, past_key_values_length + seq_len,
+                dtype=torch.long, device=input_ids.device
+            )
+        # position_ids가 [L] 또는 [B,L]일 수 있음
         return self.weight[position_ids]
 
-# --- BartAttention ---
 
+# ------------------------------
+# Attention
+# ------------------------------
 class BartAttention(nn.Module):
     def __init__(
         self,
@@ -102,7 +122,6 @@ class BartAttention(nn.Module):
                 f"Instantiating a decoder {self.__class__.__name__} without passing layer_idx is not recommended."
             )
 
-        # 각 Linear의 입력과 출력 차원을 embed_dim으로 맞춤
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -113,7 +132,7 @@ class BartAttention(nn.Module):
         hidden_states: torch.Tensor,
         key_value_states: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,  # additive mask (-inf/0) 기대
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         cache_position: Optional[torch.Tensor] = None,
@@ -123,31 +142,30 @@ class BartAttention(nn.Module):
         bsz, tgt_len, embed_dim = hidden_states.size()
         src_len = key_value_states.size(1) if key_value_states is not None else tgt_len
 
-        # query shape: (bsz, num_heads, tgt_len, head_dim)
+        # (B, H, T, Dh)
         query = self.q_proj(hidden_states).view(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if key_value_states is not None:
-            # key, value shape: (bsz, num_heads, src_len, head_dim)
             key = self.k_proj(key_value_states).view(bsz, src_len, self.num_heads, self.head_dim).transpose(1, 2)
             value = self.v_proj(key_value_states).view(bsz, src_len, self.num_heads, self.head_dim).transpose(1, 2)
         else:
             key = self.k_proj(hidden_states).view(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
             value = self.v_proj(hidden_states).view(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # scores shape: (bsz, num_heads, tgt_len, src_len)
+        # (B, H, T, S)
         scores = torch.matmul(query, key.transpose(-2, -1)) * self.scaling
 
         if attention_mask is not None:
-            # attention_mask shape: (bsz, 1, 1, src_len)
+            # attention_mask는 additive(-inf/0), shape broadcastable to (B,1,T,S)
+            attention_mask = attention_mask.to(dtype=scores.dtype)
             scores = scores + attention_mask
 
         attn_weights = torch.softmax(scores, dim=-1)
         attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
-        # attn_output shape: (bsz, num_heads, tgt_len, head_dim)
+        # (B, H, T, Dh)
         attn_output = torch.matmul(attn_weights, value)
-
-        # (bsz, tgt_len, num_heads, head_dim) 으로 transpose 후 reshape
+        # (B, T, H, Dh) -> (B, T, D)
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, tgt_len, embed_dim)
 
         attn_output = self.out_proj(attn_output)
@@ -158,10 +176,9 @@ class BartAttention(nn.Module):
             return attn_output, None, past_key_value
 
 
-
-
-# --- BartDecoderLayer ---
-
+# ------------------------------
+# Decoder Layer
+# ------------------------------
 class BartDecoderLayer(nn.Module):
     def __init__(self, config: PretrainedConfig, layer_idx: Optional[int] = None):
         super().__init__()
@@ -198,9 +215,9 @@ class BartDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,  # (B,1,T,S) additive
+        encoder_hidden_states: Optional[torch.Tensor] = None,  # (B,S,D)
+        encoder_attention_mask: Optional[torch.Tensor] = None,  # (B,1,1,S) additive
         layer_head_mask: Optional[torch.Tensor] = None,
         cross_attn_layer_head_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -208,8 +225,8 @@ class BartDecoderLayer(nn.Module):
         use_cache: Optional[bool] = True,
         cache_position: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        # Self-Attention
         residual = hidden_states
-
         hidden_states, self_attn_weights, past_key_value = self.self_attn(
             hidden_states=hidden_states,
             past_key_value=past_key_value,
@@ -222,6 +239,7 @@ class BartDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
+        # Cross-Attention
         cross_attn_weights = None
         if encoder_hidden_states is not None:
             residual = hidden_states
@@ -238,6 +256,7 @@ class BartDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
             hidden_states = self.encoder_attn_layer_norm(hidden_states)
 
+        # FFN
         residual = hidden_states
         hidden_states = self.activation_fn(self.fc1(hidden_states))
         hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
@@ -253,8 +272,10 @@ class BartDecoderLayer(nn.Module):
             outputs += (past_key_value,)
         return outputs
 
-# --- BartDecoder ---
 
+# ------------------------------
+# Decoder
+# ------------------------------
 class BartDecoder(nn.Module):
     def __init__(self, config: PretrainedConfig, embed_tokens: Optional[nn.Embedding] = None):
         super().__init__()
@@ -280,32 +301,43 @@ class BartDecoder(nn.Module):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    # --- 마스크 유틸 ---
     def _update_causal_mask(self, attention_mask, inputs_embeds, cache_position, self_attn_cache):
-        seq_len = attention_mask.size(1)  # 시퀀스 길이
+        """
+        반환 shape: (B, 1, T, T) additive mask
+        - causal 상삼각: (1,1,T,T) with -inf above diagonal
+        - pad 마스크:   (B,1,1,T) with -inf at pad positions
+        """
+        seq_len = attention_mask.size(1)
 
-        # causal mask 생성 (상삼각 행렬)
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attention_mask.device), diagonal=1)
-        causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))  # [seq_len, seq_len]
+        causal_mask = causal_mask.masked_fill(causal_mask == 1, float("-inf")).unsqueeze(0).unsqueeze(0)  # (1,1,T,T)
 
-        # 차원 확장
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-        attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [bsz, 1, 1, seq_len]
+        # 곱셈으로 -inf 생성 금지(0 * -inf = nan). 불리언 + masked_fill 방식 사용.
+        pad = (attention_mask == 0).unsqueeze(1).unsqueeze(2)  # (B,1,1,T)
+        pad = pad.to(dtype=inputs_embeds.dtype)
+        pad = pad.masked_fill(pad.bool(), float("-inf"))
 
-        # 더하기 (broadcasting)
-        combined_mask = attention_mask + causal_mask  # [bsz, 1, seq_len, seq_len]
+        combined_mask = causal_mask + pad  # (B,1,T,T)
         return combined_mask
 
     def _update_cross_attn_mask(self, encoder_hidden_states, encoder_attention_mask, input_shape, inputs_embeds):
+        """
+        반환 shape: (B, 1, 1, S) additive mask
+        """
         if encoder_attention_mask is None:
             return None
-        return encoder_attention_mask.unsqueeze(1).unsqueeze(2)
+        pad = (encoder_attention_mask == 0).unsqueeze(1).unsqueeze(2)  # (B,1,1,S)
+        pad = pad.to(dtype=inputs_embeds.dtype)
+        pad = pad.masked_fill(pad.bool(), float("-inf"))
+        return pad
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,  # (B,T)
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,  # (B,S,D)
+        encoder_attention_mask: Optional[torch.LongTensor] = None,  # (B,S)
         head_mask: Optional[torch.Tensor] = None,
         cross_attn_head_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -346,12 +378,13 @@ class BartDecoder(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones(batch_size, seq_length, device=inputs_embeds.device)
 
-        # causal mask 업데이트
+        # (B,1,T,T) self-attn additive mask
         attention_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values)
-
-        # cross attention mask 업데이트
+        # (B,1,1,S) cross-attn additive mask
         encoder_attention_mask = self._update_cross_attn_mask(encoder_hidden_states, encoder_attention_mask, input_shape, inputs_embeds)
 
+        # 임베딩 + 포지셔널
+        # position_ids는 cache_position 사용(1D: [T]) → 반환 [T,D], (B,T,D)와 브로드캐스트 덧셈
         hidden_states = inputs_embeds + self.embed_positions(input_ids, past_key_values_length, position_ids=cache_position)
         hidden_states = self.layernorm_embedding(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
@@ -388,7 +421,6 @@ class BartDecoder(nn.Module):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
 
@@ -409,8 +441,10 @@ class BartDecoder(nn.Module):
             cross_attentions=all_cross_attentions,
         )
 
-# --- BartConfig ---
 
+# ------------------------------
+# Config
+# ------------------------------
 class BartConfig(PretrainedConfig):
     model_type = "bart"
 
@@ -476,27 +510,85 @@ class BartConfig(PretrainedConfig):
             **kwargs,
         )
 
-# --- CorrectionModel ---
 
+# ------------------------------
+# CorrectionModel (Encoder-Decoder 접합)
+# ------------------------------
 class CorrectionModel(nn.Module):
-    def __init__(self, encoder_name="beomi/kcbert-base", num_decoder_layers=6, vocab_size=32000):
+    """
+    - 인코더: KC-BERT (beomi/kcbert-base)
+    - 디코더: BART 스타일 커스텀 디코더 (vocab/특수토큰은 사용자 SPM 토크나이저에 맞춤)
+    - 출력: 로짓 (B, T, V)
+    """
+    def __init__(
+        self,
+        encoder_name: str = "beomi/kcbert-base",
+        num_decoder_layers: int = 6,
+        decoder_tokenizer=None,          # 사용자 SPM 토크나이저 객체 (필수)
+        decoder_spm_path: str = None,    # (옵션) 경로 기반 로딩 대비용
+    ):
         super().__init__()
+        # 인코더(모델/토크나이저)
         self.tokenizer = BertTokenizer.from_pretrained(encoder_name)
         self.encoder = BertModel.from_pretrained(encoder_name)
 
+        # 디코더 토크나이저
+        if decoder_tokenizer is not None:
+            self.dec_tok = decoder_tokenizer
+        else:
+            raise ValueError("decoder_tokenizer 또는 decoder_spm_path를 지정하세요.")
+
+        # 필수 특수 토큰 ID 존재 가정(data_txt.py에서 ensure 처리)
+        assert self.dec_tok.pad_token_id is not None, "Decoder tokenizer must have pad_token_id"
+        assert getattr(self.dec_tok, "bos_token_id", None) is not None, "Decoder tokenizer must have bos_token_id"
+        assert self.dec_tok.eos_token_id is not None, "Decoder tokenizer must have eos_token_id"
+
+        # BART config 동기화
         self.config = BartConfig()
         self.config.d_model = self.encoder.config.hidden_size
         self.config.decoder_layers = num_decoder_layers
-        self.config.vocab_size = self.tokenizer.vocab_size
+        self.config.vocab_size = self.dec_tok.vocab_size
+        # 주의: head 수는 d_model로 나눠떨어져야 함 (KC-BERT hidden_size=768, heads=12 => head_dim=64)
         self.config.decoder_attention_heads = 12
 
+        # 디코더 특수토큰 ID 반영
+        self.config.pad_token_id = self.dec_tok.pad_token_id
+        self.config.bos_token_id = getattr(self.dec_tok, "bos_token_id", self.config.bos_token_id)
+        self.config.eos_token_id = self.dec_tok.eos_token_id
+        self.config.decoder_start_token_id = self.config.bos_token_id
+
+        # 디코더 & 출력 projection
         self.decoder = BartDecoder(self.config)
-        self.output_projection = nn.Linear(self.config.d_model, self.config.vocab_size)
+        self.output_projection = nn.Linear(self.config.d_model, self.config.vocab_size, bias=True)
 
-    def forward(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask=None):
+        # 가중치 타이잉 (권장)
+        self.output_projection.weight = self.decoder.embed_tokens.weight
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        decoder_input_ids: Optional[torch.LongTensor],
+        decoder_attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        """
+        - decoder_input_ids가 None이면 labels로부터 shift-right 생성 필요(외부에서 생성 권장)
+        - 반환: 로짓 (B, T, V)
+        """
+        if decoder_input_ids is None:
+            if labels is None:
+                raise ValueError("decoder_input_ids 또는 labels 중 하나는 제공되어야 합니다.")
+            bos = torch.full((labels.size(0), 1), self.config.bos_token_id, device=labels.device, dtype=labels.dtype)
+            # labels의 -100은 단지 로스 마스킹 용 → 디코더 입력 생성 시 0으로 치환 후 시프트
+            base = labels.masked_fill(labels.eq(-100), 0)
+            decoder_input_ids = torch.cat([bos, base[:, :-1].clone()], dim=1)
+
+        # 인코더
         encoder_outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        memory = encoder_outputs.last_hidden_state
+        memory = encoder_outputs.last_hidden_state  # (B, S, D)
 
+        # 디코더
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
@@ -504,5 +596,6 @@ class CorrectionModel(nn.Module):
             encoder_attention_mask=attention_mask,
         )
 
-        logits = self.output_projection(decoder_outputs.last_hidden_state)
+        # 로짓
+        logits = self.output_projection(decoder_outputs.last_hidden_state)  # (B, T, V)
         return logits
