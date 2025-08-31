@@ -1,6 +1,8 @@
 root@986d73f0cf4d:/workspace/sentence/src# python3 eval_cpt.py
-[Info] device: cpu
+[Info] device: cuda
 /usr/local/lib/python3.12/dist-packages/transformers/convert_slow_tokenizer.py:559: UserWarning: The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option which is not implemented in the fast tokenizers. In practice this means that the fast version of the tokenizer can produce unknown tokens whereas the sentencepiece version would have converted these unknown tokens into a sequence of byte tokens matching the original piece of text.
   warnings.warn(
 [Info] Added missing special tokens to decoder tokenizer.
 [Load] ./checkpoints/step_222828_best_val_loss.pt
+[VAL ] loss 11.4884 | acc 4.70% | cer 10.0662
+[TEST] loss 11.4864 | acc 4.71% | cer 10.0497
